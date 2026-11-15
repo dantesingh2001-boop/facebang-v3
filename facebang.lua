@@ -1,6 +1,6 @@
 --[[
 ================================================================================
-  FACE BANG   v3.0.3      on-the-face bangs / zero delay
+  FACE BANG   v3.0.4      on-the-face bangs / zero delay
 ================================================================================
   WHAT IT IS
   A client-side panel whose bang is a motion you own plus a picture at the
@@ -94,7 +94,7 @@
 
 do
 	-- single source of truth: the UI header prints this, so it must not drift
-	local VERSION = "3.0.3"
+	local VERSION = "3.0.4"
 
 	local ENV = (getgenv and getgenv()) or _G
 	if type(ENV.FaceBang) == "table" and type(ENV.FaceBang.Unload) == "function" then
@@ -163,7 +163,9 @@ do
 		-- anything to them, so they are never held, paused or pushed.
 		Motion = "teleport",
 		Stage = 4,           -- studs you snap back to between hits
-		MotionRate = 1,      -- 1 = every frame pass, 2 = every second, 3 = every third
+		-- seconds for one full in-and-out cycle. 0.22 is a readable bounce;
+		-- higher is slower. Paced by TIME so it feels identical at any fps.
+		MotionPeriod = 0.22,
 		ReturnOnStop = true, -- put you back where you started on stop
 
 		FXLimit = 90,       -- hard cap on live bang parts, so a fast pulse cannot churn
@@ -296,13 +298,23 @@ do
 			-- face if you were already standing on top of them
 			Engine.axis = d.Magnitude > 1 and d.Unit or (-(headCF.LookVector))
 		end
-		-- rate: 1 = a write every pass, 2 = every second pass, 3 = every third.
-		-- Slows the shuttle down without adding or removing frame passes.
-		local rate = math.max(1, math.floor(tonumber(Config.MotionRate) or 1))
-		if rate > 1 then
-			Engine.moveTick = (Engine.moveTick or 0) + 1
-			if Engine.moveTick % rate ~= 0 then return end
-		end
+		--[[
+		  Rate is TIME based, not pass based.
+
+		  This used to flip phase on every frame pass, so the shuttle ran at the
+		  frame rate: at 60 fps you teleported in and out 60 times a second, which
+		  is what "way too fast" was. Counting passes did not help either - it
+		  tied the speed to the fps, so the same setting was different on a phone
+		  and a desktop, and slowing the counter also slowed how fast you landed.
+
+		  Now there is a period in seconds: one full in-and-out cycle per
+		  Config.MotionPeriod. The first flip after starting is free so the press
+		  still lands instantly (zero delay), and afterwards it is paced.
+		]]
+		local period = math.max(0.02, tonumber(Config.MotionPeriod) or 0.22)
+		local now = os.clock()
+		if Engine.nextFlip and now < Engine.nextFlip then return end
+		Engine.nextFlip = now + period * 0.5
 		Engine.phase = not Engine.phase
 		local at = headCF.Position + Vector3.new(0, 0.2, 0)
 		if not Engine.phase then at = at + Engine.axis * Config.Stage end
@@ -320,6 +332,7 @@ do
 		Engine.saved = nil
 		Engine.phase = false
 		Engine.axis = nil
+		Engine.nextFlip = nil
 		if not saved then return end
 		local hrp, hum = myRoot(), myHum()
 		if doReturn and hrp and saved.cframe then
@@ -428,6 +441,7 @@ do
 		Engine.root = hrp
 		Engine.head = head
 		Engine.running = true
+		Engine.nextFlip = nil
 
 		--[[
 		  Zero delay means the first teleport happens NOW, synchronously, exactly
@@ -4905,7 +4919,12 @@ end
 
 	stepper(aim, 6, "back off", { 2, 4, 6, 9 }, function(v) Config.Stage = v end, 2)
 
-	stepper(aim, 7, "rate (every Nth pass)", { 1, 2, 3, 4 }, function(v) Config.MotionRate = v end, 1)
+	-- a period, not a pass count: "0.35 s" means the same thing on a phone and a
+	-- desktop, whereas "every 2nd pass" was 30/s on one and 120/s on the other
+	stepper(aim, 7, "bounce speed", { "0.45 s", "0.35 s", "0.22 s", "0.12 s", "0.06 s" }, function(v)
+		Config.MotionPeriod = tonumber((v:gsub(" s$", ""))) or 0.22
+		out("bounce: one cycle every " .. v)
+	end, 3)
 
 	toggle(aim, 8, "return me on stop", function(on) Config.ReturnOnStop = on end, true)
 
