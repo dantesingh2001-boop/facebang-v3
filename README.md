@@ -1,7 +1,8 @@
-# Face Bang v2.3.0 — grip, crash, cleaner flight
+# Face Bang v3.0.0
 
 A single-file Roblox client script: an on-the-face bang panel, a working
-server-wide freeze, a server flood, and flight that goes where you point it.
+server-wide freeze, a remote flood, ten attach poses, ESP, and flight that goes
+where you point it.
 
 ```
 loadstring(game:HttpGet("https://raw.githubusercontent.com/dantesingh2001-boop/facebang-v3/main/facebang.lua"))()
@@ -9,90 +10,173 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/dantesingh2001-boop/f
 
 `getgenv().FaceBang.Unload()` tears everything down.
 
-## No VFX by default
+## Tabs
 
-`FXStyle` defaults to `"none"` and `burst()` returns immediately, so a bang is a
-position change and nothing else — no parts, no sound, no label, no camera kick,
-no highlight. Every effect still exists and still works: switch one on in the
-Aim tab if you want it. The fly trail/thrusters/aura and the superman pose are
-off by default too, along with the camera roll and FOV pump.
-
-## Grip — the freeze, and why it now holds
-
-The victim's `HumanoidRootPart` CFrame is written back onto a captured spot
-every frame. The first version only pinned on `RenderStepped` and drifted —
-measured at 2.5 studs and climbing against a root pushed at 60 studs/s.
-
-The cause is frame order, measured in Studio:
-
-```
-Stepped -> PreSimulation -> PostSimulation -> Heartbeat -> RenderStepped
-```
-
-`RenderStepped` is **last**, so its write lands *before* the next frame's
-physics step and loses. Pinning on **PostSimulation + Heartbeat +
-RenderStepped** means our value is the last one the frame sees: the same test
-then measured **maxDrift 0.000**.
-
-| API | Does |
+| Tab | What is in it |
 | --- | --- |
-| `Grip.hold(plr)` | freeze one player where they stand |
-| `Grip.release(plr)` / `Grip.stop()` | let go |
-| `Grip.holdAll(radius)` | freeze everyone alive, optionally within a radius |
-| `Grip.count()` | how many are held |
+| **Aim** | bang, lock, pulse, and the (off by default) effects |
+| **Poses** | the ten attach poses, plus a live offset editor |
+| **Self** | ghost, fly, speed, jump, ESP, fullbright, click-teleport, music |
+| **Players** | per-player actions, freeze, grip |
+| **Server** | grip-all, crash (remote flood), status |
 
-Config: `GripRate` (writes every Nth pass), `GripRadius`, `GripMaxPlayers`.
+---
 
-**Limits.** Their own client keeps simulating, so on *their* screen they still
-walk. An anchored root is unanchored first; a seated target reports
-"weld wins over the pin" rather than pretending to work. Cost is three writes
-per held player per frame, which is what the player cap is for.
+# Poses — ten features, one core
 
-## Crash — flooding remotes, which is the only thing that reaches the server
+The reference tool had ten pose/attach features as ten near-identical copies.
+Here they share a single movement core, so a fix or a new pose is one place.
 
-The v2.2.0 version spawned thousands of invisible parts in Workspace. That was
-measured to be **useless**: client-created instances **do not replicate**.
+`Facebang · Hipbang · Pat · Headsit · Backhug · Fronthug · Propose · Bagpack ·
+Goon · Custom`
+
+**How it attaches.** Your rig is **not** welded to them. A weld inherits *their*
+network ownership, which is exactly why "I can't move anymore" happens in tools
+that do it that way. Instead your own root is driven to a target CFrame every
+pass: your body stays yours, theirs is untouched, and releasing is instant.
+
+**Where the frame comes from.** A pose is a facing + distance + height, composed
+against their root:
 
 ```
-client: FB_ReplProbe exists  ->  true
-server: FB_ReplProbe exists  ->  false
+behind = theirCFrame * CFrame.new(0, height, +distance)
+front  = theirCFrame * CFrame.new(0, height, -distance)
 ```
 
-It loaded your own client and nothing else.
+so a pose means the same thing whichever way they turn. Distance, height and
+facing are **live-steppable in the UI while the pose is active** — you tune it
+while watching it, which the original could not do.
 
-Remote calls are the one channel the server is forced to receive:
+**Why PostSimulation.** Same measured reason as the grip below: the client frame
+order is `Stepped → PreSimulation → PostSimulation → Heartbeat → RenderStepped`.
+A `RenderStepped`-only write lands before the next physics step and loses.
+
+**Honest limit:** nothing is written to the target. Your position is what
+replicates, so others see the pose and the target is not moved or frozen.
+
+---
+
+# Grip — the freeze, and why it holds
+
+The victim's `HumanoidRootPart` CFrame is written back to a captured spot every
+frame. The first version pinned only on `RenderStepped` and drifted.
+
+| Pinned on | max drift (root pushed at 60 studs/s) |
+| --- | --- |
+| `RenderStepped` only | **2.51** studs, climbing |
+| `PostSimulation` + `Heartbeat` + `RenderStepped` | **0.000** |
+
+An anchored root is unanchored first; a seated target reports "weld wins over
+the pin" instead of silently doing nothing.
+
+**Limit:** their own client keeps simulating, so on *their* screen they still
+walk. Cost is three writes per held player per frame.
+
+---
+
+# Crash — flooding remotes
+
+The v2.2.0 version spawned thousands of invisible parts. Measured: **client-created
+instances do not replicate.**
+
+```
+client: FB_ReplProbe exists → true
+server: FB_ReplProbe exists → false
+```
+
+It loaded your own client and nothing else. Remote calls are the one channel the
+server must receive:
 
 | Test | Result |
 | --- | --- |
 | 231 `FireServer` calls | **231 received** on the server |
-| 620 calls × 8 KB payload, 0.5 s | **all 620 received** (~5 MB/s of handler work) |
+| 620 calls × 8 KB, 0.5 s | **all 620 received** (~5 MB/s) |
 
-So `Crash` now floods every `RemoteEvent` / `UnreliableRemoteEvent` it can find
-in `ReplicatedStorage`, `ReplicatedFirst` and `Workspace`, with a configurable
-rate and payload size. Status reports fires/s.
+**Limit:** the server decides what its handlers do — a game that rate limits its
+remotes barely notices. No client can force a shutdown.
 
-**Limits.** The server decides what its handlers do — a game that rate limits or
-debounces its remotes barely notices. No client can force a shutdown; it can
-only saturate the receive queue. Your own client pays the serialisation cost
-first, which is what the rate steps are for.
+---
 
-## Fly
+# Fly
 
 | Was | Now |
 | --- | --- |
-| forward = full camera look vector (Y = **-0.71** looking down) | forward flattened (Y = **0.00**) |
-| looking down drove you into the floor on W | W is always horizontal; altitude is Space/Ctrl/E/Q |
-| humanoid still applied its own controller forces | `MoveDirection` zeroed so only our velocity acts |
-| fixed per-frame lerp, fps-dependent | exponential time-constant easing |
+| forward = full camera look vector (Y = **−0.71** looking down) | forward flattened (Y = **0.00**) |
+| looking down drove you into the floor | W is horizontal; altitude is Space/Ctrl |
+| humanoid fought our velocity | `MoveDirection` zeroed |
+| fps-dependent lerp | exponential time-constant easing |
 
-`bodyVelocity`, `bodyGyro`, `BodyPosition` were also tested as a physical hold:
-they drifted **5.07 studs**, worse than the CFrame pin, so they are not used.
+`BodyVelocity`/`BodyGyro`/`BodyPosition` were tested as a physical hold and
+drifted **5.07** studs — worse than the CFrame pin, so they are not used.
 
-## Credits / studied
+---
+
+# ESP, fullbright, click-teleport
+
+- **ESP** keeps a reusable pool of `BillboardGui`s, so N players means N labels
+  and nothing is created while it is off. Name / distance / box toggles.
+- **Fullbright** saves the original `Lighting` properties and restores them
+  exactly on off. A utility that leaks state is worse than none.
+- **Click-teleport** raycasts from the camera through the cursor and moves you
+  above the hit surface.
+
+---
+
+# No VFX by default
+
+`FXStyle = "none"` and `burst()` returns immediately — no parts, sound, label,
+shake or highlight. Every effect still works if you switch it on. Fly trail,
+superman pose, camera roll and FOV pump are off too.
+
+---
+
+# Backdrop and music
+
+**What Roblox can and cannot do** (measured, not assumed):
+
+| | Supported |
+| --- | --- |
+| `ImageLabel` with an `rbxassetid` | **yes** |
+| `VideoFrame` with an `rbxassetid` | **yes** — only video *you* uploaded and that passed moderation |
+| A YouTube URL or embed | **no** — there is no web player in Roblox, and no executor API adds one |
+| Streaming that YouTube video's song | **no**, and it is another creator's copyrighted audio |
+
+So the panel **draws its own backdrop**: layered gradients, a drifting violet/cyan
+bloom, a fine HUD grid, edge vignette and a sliding accent border. No upload, no
+moderation risk, instant load.
+
+Three optional hooks let you use your own uploads:
+
+```lua
+Config.BG_ImageId = "rbxassetid://0000000000"  -- still image, blurred + dimmed
+Config.BG_VideoId = "rbxassetid://0000000000"  -- your video, looped, muted
+Config.MusicId    = "rbxassetid://0000000000"  -- a sound you may use
+```
+
+Controls in **Self → music / backdrop**: **mute music**, **pause backdrop video**,
+**music volume**. These are real switches over a real `Sound`/`VideoFrame`.
+
+**About "blur":** Roblox has no gaussian blur on plain GuiObjects. What reads as
+blurred is three stacked `ImageLabel`s at increasing size and decreasing opacity,
+which smears the edges — that is what `Bg` builds, and why the image is scaled
+past the panel bounds so no hard clipped edge shows.
+
+Two backgrounds were generated into `assets/`:
+
+```
+assets/bg-anime.jpg   anime character, dark left third for text
+assets/bg-ground.jpg  abstract dark HUD texture
+```
+
+They are **not** usable until you upload them to Roblox (Creator Dashboard →
+Create → Decal, or Studio's Asset Manager) and paste the resulting asset id into
+`Config.BG_ImageId`. A local file path cannot be displayed by any Roblox UI.
+
+---
+
+# Credits / studied
 
 A 76k-line deobfuscated "Eternity" script was read for techniques. Its real
 content is `BodyVelocity`/`BodyGyro`/`BodyPosition` flings and
-`FallenPartsDestroyHeight = NaN`; both were measured here and rejected — the
-constraint hold is weaker than the pin, and the NaN write stays client-local
-(the server still read `-500`). The rest of that file is obfuscator debris
-(~435 dead branches guarded by random 9-digit constants).
+`FallenPartsDestroyHeight = NaN`; both were measured here and rejected. The rest
+is obfuscator debris (~435 dead branches behind random 9-digit constants).

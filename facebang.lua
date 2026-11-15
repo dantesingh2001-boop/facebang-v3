@@ -1,6 +1,6 @@
 --[[
 ================================================================================
-  FACE BANG   v2.3.0      on-the-face bangs / zero delay
+  FACE BANG   v3.0.0      on-the-face bangs / zero delay
 ================================================================================
   WHAT IT IS
   A client-side panel whose bang is a motion you own plus a picture at the
@@ -94,7 +94,7 @@
 
 do
 	-- single source of truth: the UI header prints this, so it must not drift
-	local VERSION = "2.3.0"
+	local VERSION = "3.0.0"
 
 	local ENV = (getgenv and getgenv()) or _G
 	if type(ENV.FaceBang) == "table" and type(ENV.FaceBang.Unload) == "function" then
@@ -146,6 +146,17 @@ do
 		FXMarker = false,   -- outline the locked target
 		FlyFX = false,      -- trail, thrusters, aura, camera bank, FOV
 		FlyPose = false,    -- superman pose: body flat, arms forward (rig joints)
+
+		-- Backdrop / media. Roblox can only show rbxassetid assets it hosts, so
+		-- these are OPTIONAL hooks for things you uploaded yourself. Empty means
+		-- the panel draws its own animated backdrop, which needs no upload.
+		--   BG_ImageId: "rbxassetid://0000"  a still image (blurred + dimmed)
+		--   BG_VideoId: "rbxassetid://0000"  a video YOU uploaded (looped, muted)
+		--   MusicId:    "rbxassetid://0000"  a Roblox sound you may use
+		BG_ImageId = "",
+		BG_VideoId = "",
+		MusicId = "",
+		MusicMuted = false,
 
 		-- bang motion: "teleport" = you go onto their face and snap back out,
 		-- repeating; "visual" = you never leave your spot. Neither one writes
@@ -1176,6 +1187,505 @@ end
 
 	return Crash
 	end)()
+
+	local ToolsLib = (function()
+--[[
+  tools.lua - the general-purpose self utilities.
+
+  These are the "everything else" from the reference tool: ESP, fullbright, no
+  fog, click-to-teleport, click-to-target. Each one is written so that turning it
+  OFF fully undoes it - a utility that leaks state is worse than no utility,
+  because you stop being able to tell what is actually on.
+
+  ESP is the one worth explaining. The reference tool highlighted players with a
+  BillboardGui per player. That works, but it leaks a Gui into their character
+  and keeps doing per-frame work for players who are behind you or dead. This
+  version keeps one pool of labels and reuses them, so N players means N labels
+  and nothing is created while ESP is off.
+]]
+
+local Tools = {}
+
+function Tools.new(ctx)
+	local Players = ctx.Players
+	local RunService = ctx.RunService
+	local LP = ctx.LP
+	local TweenService = ctx.TweenService
+	local Lighting = ctx.Lighting or game:GetService("Lighting")
+	local UIS = ctx.UIS or game:GetService("UserInputService")
+
+	local M = {}
+
+	--==================================================================== ESP
+	local esp = {
+		enabled = false,
+		box = false,
+		name = true,
+		distance = true,
+		tracer = false,
+		color = Color3.fromRGB(140, 100, 255),
+		conn = nil,
+		labels = {},   -- [player] = { gui = BillboardGui, ... }
+		lines = nil,
+	}
+
+	local function cleanupEsp(p)
+		local rec = esp.labels[p]
+		if not rec then return end
+		for _, obj in pairs(rec) do
+			if type(obj) == "table" then
+				if obj.gui and obj.gui.Parent then pcall(function() obj.gui:Destroy() end) end
+			elseif typeof(obj) == "Instance" and obj.Parent then
+				pcall(function() obj:Destroy() end)
+			elseif typeof(obj) == "RBXScriptConnection" then
+				pcall(function() obj:Disconnect() end)
+			end
+		end
+		esp.labels[p] = nil
+	end
+
+	local function buildEsp(p)
+		cleanupEsp(p)
+		local rec = {}
+		esp.labels[p] = rec
+
+		local gui = Instance.new("BillboardGui")
+		gui.Name = "FB_ESP"
+		gui.Size = UDim2.fromOffset(52, 68)
+		gui.StudsOffset = Vector3.new(0, 2.4, 0)
+		gui.AlwaysOnTop = true
+		gui.LightInfluence = 0
+		gui.MaxDistance = 1000
+		gui.Adornee = nil
+
+		local frame = Instance.new("Frame")
+		frame.Size = UDim2.fromScale(1, 1)
+		frame.BackgroundTransparency = 1
+		frame.Parent = gui
+
+		local box = Instance.new("Frame")
+		box.Name = "Box"
+		box.Size = UDim2.fromScale(1, 1)
+		box.BackgroundColor3 = esp.color
+		box.BackgroundTransparency = 0.88
+		box.BorderSizePixel = 0
+		box.Parent = frame
+		local bc = Instance.new("UICorner")
+		bc.CornerRadius = UDim.new(0, 4)
+		bc.Parent = box
+		local bs = Instance.new("UIStroke")
+		bs.Color = esp.color
+		bs.Thickness = 1
+		bs.Transparency = 0.25
+		bs.Parent = box
+
+		local label = Instance.new("TextLabel")
+		label.Name = "Info"
+		label.Size = UDim2.new(1, 0, 0, 26)
+		label.Position = UDim2.new(0, 0, 1, 2)
+		label.BackgroundTransparency = 1
+		label.TextColor3 = Color3.new(1, 1, 1)
+		label.Font = Enum.Font.GothamBold
+		label.TextSize = 11
+		label.TextStrokeTransparency = 0.4
+		label.Text = ""
+		label.Parent = frame
+
+		rec.gui = gui
+		rec.box = box
+		rec.label = label
+		return rec
+	end
+
+	local function refreshEspTarget(p, plr)
+		local rec = esp.labels[plr]
+		if not rec then return end
+		local char = plr.Character
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		local visible = hrp ~= nil and hum ~= nil and hum.Health > 0 and plr ~= LP
+		rec.gui.Adornee = visible and hrp or nil
+		rec.gui.Enabled = visible
+		if not visible then return end
+
+		rec.box.Visible = esp.box
+		local bits = {}
+		if esp.name then bits[#bits + 1] = plr.Name end
+		if esp.distance then
+			local myChar = LP.Character
+			local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+			if myRoot then
+				bits[#bits + 1] = string.format("%dm", math.floor((myRoot.Position - hrp.Position).Magnitude))
+			end
+		end
+		rec.label.Text = table.concat(bits, " ")
+		rec.label.Visible = #bits > 0
+	end
+
+	local function espStep()
+		if not esp.enabled then return end
+		for plr, rec in pairs(esp.labels) do
+			if not plr.Parent then
+				cleanupEsp(plr)
+			else
+				if not rec.gui.Parent then rec.gui.Parent = game:GetService("CoreGui") end
+				refreshEspTarget(rec, plr)
+			end
+		end
+	end
+
+	function M.esp(enabled)
+		esp.enabled = enabled == true
+		if esp.enabled then
+			for _, plr in ipairs(Players:GetPlayers()) do
+				local rec = buildEsp(plr)
+				rec.gui.Parent = game:GetService("CoreGui")
+			end
+			if not esp.conn then
+				esp.conn = RunService.RenderStepped:Connect(espStep)
+			end
+			espStep()
+		else
+			if esp.conn then pcall(function() esp.conn:Disconnect() end) esp.conn = nil end
+			for plr in pairs(esp.labels) do cleanupEsp(plr) end
+			table.clear(esp.labels)
+		end
+		return esp.enabled
+	end
+
+	function M.setEspOption(key, value)
+		if esp[key] == nil then return false end
+		esp[key] = value
+		return true
+	end
+
+	function M.espOptions() return { box = esp.box, name = esp.name, distance = esp.distance } end
+
+	--============================================================= fullbright
+	local fb = { on = false, saved = nil }
+
+	function M.fullbright(on)
+		if on then
+			if fb.on then return true end
+			fb.saved = {
+				Brightness = Lighting.Brightness,
+				Ambient = Lighting.Ambient,
+				OutdoorAmbient = Lighting.OutdoorAmbient,
+				ClockTime = Lighting.ClockTime,
+				FogEnd = Lighting.FogEnd,
+				FogStart = Lighting.FogStart,
+				EnvironmentDiffuseScale = Lighting.EnvironmentDiffuseScale,
+			}
+			Lighting.Brightness = 2
+			Lighting.Ambient = Color3.fromRGB(160, 160, 160)
+			Lighting.OutdoorAmbient = Color3.fromRGB(160, 160, 160)
+			Lighting.ClockTime = 12
+			Lighting.FogEnd = 100000
+			Lighting.FogStart = 100000
+			Lighting.EnvironmentDiffuseScale = 0
+			fb.on = true
+		else
+			if not fb.on or not fb.saved then return false end
+			for k, v in pairs(fb.saved) do
+				pcall(function() Lighting[k] = v end)
+			end
+			fb.saved = nil
+			fb.on = false
+		end
+		return fb.on
+	end
+
+	--=================================================================== noclip
+	local noclipConn = nil
+
+	function M.noclip(on)
+		if on and not noclipConn then
+			noclipConn = RunService.Stepped:Connect(function()
+				local char = LP.Character
+				if not char then return end
+				for _, d in ipairs(char:GetDescendants()) do
+					if d:IsA("BasePart") and d.CanCollide then d.CanCollide = false end
+				end
+			end)
+		elseif not on and noclipConn then
+			pcall(function() noclipConn:Disconnect() end)
+			noclipConn = nil
+			local char = LP.Character
+			if char then
+				for _, d in ipairs(char:GetDescendants()) do
+					if d:IsA("BasePart") then d.CanCollide = true end
+				end
+			end
+		end
+		return noclipConn ~= nil
+	end
+
+	--=========================================================== click teleport
+	local clickTp = { on = false, conn = nil }
+
+	function M.clickTeleport(on, enabledFn)
+		clickTp.on = on == true
+		if clickTp.on and not clickTp.conn then
+			clickTp.conn = UIS.InputBegan:Connect(function(input, gameHandled)
+				if gameHandled then return end
+				if input.UserInputType ~= Enum.UserInputType.MouseButton1
+					and input.UserInputType ~= Enum.UserInputType.Touch then return end
+				if enabledFn and not enabledFn() then return end
+				local cam = workspace.CurrentCamera
+				local char = LP.Character
+				local root = char and char:FindFirstChild("HumanoidRootPart")
+				if not cam or not root then return end
+
+				-- cast from the camera through the cursor (or the touch point)
+				local pos = input.Position
+				local rp = RaycastParams.new()
+				rp.FilterType = Enum.RaycastFilterType.Exclude
+				rp.FilterDescendantsInstances = { char }
+				local unitRay = cam:ViewportPointToRay(pos.X, pos.Y)
+				local hit = workspace:Raycast(unitRay.Origin, unitRay.Direction * 5000, rp)
+				if not hit then return end
+				local want = hit.Position + Vector3.new(0, 3, 0)
+				pcall(function() root.CFrame = CFrame.new(want) end)
+			end)
+		elseif not clickTp.on and clickTp.conn then
+			pcall(function() clickTp.conn:Disconnect() end)
+			clickTp.conn = nil
+		end
+		return clickTp.on
+	end
+
+	function M.stop()
+		if esp.conn then pcall(function() esp.conn:Disconnect() end) esp.conn = nil end
+		for plr in pairs(esp.labels) do cleanupEsp(plr) end
+		table.clear(esp.labels)
+		esp.enabled = false
+		if noclipConn then pcall(function() noclipConn:Disconnect() end) noclipConn = nil end
+		if clickTp.conn then pcall(function() clickTp.conn:Disconnect() end) clickTp.conn = nil end
+		clickTp.on = false
+		M.fullbright(false)
+	end
+
+	return M
+end
+
+	return Tools
+	end)()
+
+	local PosesLib = (function()
+--[[
+  poses.lua - the attach / pose family
+
+  These are the ten things the reference tool had (Facebang, Hipbang, Pat,
+  Headsit, Backhug, Fronthug, Propose, Bagpack, Goon, CustomAttach), rebuilt so
+  they share one movement core instead of ten near-copies.
+
+  HOW IT ATTACHES
+  Your rig is not welded to them. Welding a character to another character is
+  what makes "I got stuck" reports: the weld inherits their network ownership,
+  so your own movement stops replicating and you have to be rescued. Instead
+  this drives your own root with a target CFrame every pass - your body is
+  yours, their body is untouched, and releasing is instant.
+
+  WHERE THE TARGET FRAME COMES FROM
+  A pose is a name, a facing (front/back/left/right), a distance and a height.
+  That composes into an offset from THEIR root, rotated by their facing:
+
+      behind  = their CFrame * CFrame.new(0, height, distance)
+      front   = their CFrame * CFrame.new(0, height, -distance)
+
+  so a pose keeps meaning the same thing no matter which way they turn. The
+  reference tool hard-coded most of these; here they are Config.PoseOffsets,
+  editable from the UI and saved per pose.
+
+  WHY PostSimulation
+  Same measured reason as the grip: the client frame order is
+      Stepped -> PreSimulation -> PostSimulation -> Heartbeat -> RenderStepped
+  Writing on RenderStepped only means the write lands before the next physics
+  step. Pinning on PostSimulation + RenderStepped keeps you attached through
+  the physics pass.
+
+  WHAT IT DOES NOT DO
+  Nothing is written to them. Your client position is what replicates, so other
+  players see the pose and the target does not get moved, frozen or flung. This
+  is the same honest limit every client-side pose tool has.
+]]
+
+local Poses = {}
+
+function Poses.new(ctx)
+	local RunService = ctx.RunService
+	local LP = ctx.LP
+	local M = {}
+
+	-- name -> { facing, distance, height, roll }
+	-- distance is studs along their facing axis, height is studs up from their
+	-- root. The values are deliberate: they put the two rigs' heads at roughly
+	-- the same height, which is what makes a pose read correctly.
+	local DEFS = {
+		facebang   = { label = "Facebang",    facing = "front",  distance = 3.2, height = 0.0,  roll = 0 },
+		hipbang    = { label = "Hipbang",     facing = "front",  distance = 2.2, height = -0.6, roll = 0 },
+		pat        = { label = "Pat",         facing = "front",  distance = 2.4, height = 1.2,  roll = 0 },
+		headsit    = { label = "Headsit",     facing = "front",  distance = 0.35, height = 2.6, roll = 0 },
+		backhug    = { label = "Backhug",     facing = "back",   distance = 1.6, height = 0.0,  roll = 0 },
+		fronthug   = { label = "Fronthug",    facing = "front",  distance = 1.6, height = 0.0,  roll = 0 },
+		propose    = { label = "Propose",     facing = "front",  distance = 2.8, height = -1.1, roll = 0 },
+		bagpack    = { label = "Bagpack",     facing = "back",   distance = 0.9, height = 1.4,  roll = 0 },
+		goon       = { label = "Goon",        facing = "front",  distance = 2.6, height = 0.0,  roll = 0 },
+		custom     = { label = "Custom",      facing = "front",  distance = 2.5, height = 0.0,  roll = 0 },
+	}
+
+	local POSE_ORDER = {
+		"facebang", "hipbang", "pat", "headsit", "backhug",
+		"fronthug", "propose", "bagpack", "goon", "custom",
+	}
+
+	local state = {
+		pose = nil,        -- key of the active pose
+		target = nil,      -- Player
+		conn = nil,
+		offsets = {},      -- [key] = { facing, distance, height }
+		lockFacing = false,
+	}
+
+	-- seed the editable offsets from the defaults once
+	for key, d in pairs(DEFS) do
+		state.offsets[key] = { facing = d.facing, distance = d.distance, height = d.height }
+	end
+
+	local function rootOf(plr)
+		local c = plr and plr.Character
+		if not c or not c.Parent then return nil end
+		local hum = c:FindFirstChildOfClass("Humanoid")
+		if not hum or hum.Health <= 0 then return nil end
+		return c:FindFirstChild("HumanoidRootPart"), hum
+	end
+
+	local function myRoot()
+		local c = LP.Character
+		if not c or not c.Parent then return nil end
+		return c:FindFirstChild("HumanoidRootPart"), c:FindFirstChildOfClass("Humanoid")
+	end
+
+	--[[
+	  The offset for one pose, as a CFrame relative to their root.
+
+	  Facing is applied as a yaw on their own CFrame, so "front" always means
+	  in front of the direction they are facing right now. A vertical lock keeps
+	  the pose from spinning with them, which matters when they are turning
+	  while you are on their head.
+	]]
+	local function offsetCFrame(key, theirCF)
+		local o = state.offsets[key] or { facing = "front", distance = 2, height = 0 }
+		local d = math.max(0, tonumber(o.distance) or 2)
+		local h = tonumber(o.height) or 0
+		local facing = o.facing or "front"
+
+		-- their forward is -Z in Roblox; positive Z is behind them
+		local z = (facing == "back") and d or (facing == "front") and -d or 0
+		local x = (facing == "right") and d or (facing == "left") and -d or 0
+
+		local base
+		if state.lockFacing then
+			-- drop their yaw so sitting on a spinning target stays stable: the
+			-- offset is then taken in world axes instead of theirs
+			base = CFrame.new(theirCF.Position)
+		else
+			base = theirCF
+		end
+
+		return base * CFrame.new(x, h, z)
+	end
+
+	local function step()
+		local key, target = state.pose, state.target
+		if not key or not target then return end
+		local theirRoot = rootOf(target)
+		local mine = myRoot()
+		if not theirRoot or not mine then return end
+
+		local want = offsetCFrame(key, theirRoot.CFrame)
+		--[[
+		  Keep YOUR facing: only the position is imposed, so your character still
+		  looks where the camera looks. Copying their rotation made the pose read
+		  as "stuck inside their body" on every pose except the ones facing back.
+		]]
+		local keep = mine.CFrame - mine.CFrame.Position
+		local ok = pcall(function()
+			mine.CFrame = CFrame.new(want.Position) * keep
+			mine.AssemblyLinearVelocity = Vector3.zero
+			mine.AssemblyAngularVelocity = Vector3.zero
+		end)
+		if not ok then M.release() end
+	end
+
+	local function ensureConn()
+		if state.conn then return end
+		state.conn = RunService.PostSimulation:Connect(step)
+		-- second pass so the pose survives a physics tick that runs after us;
+		-- measured the same way the grip was (see grip.lua)
+		state.conn2 = RunService.RenderStepped:Connect(step)
+	end
+
+	function M.keys() return POSE_ORDER end
+	function M.label(key) return DEFS[key] and DEFS[key].label or tostring(key) end
+
+	function M.apply(key, plr)
+		if not DEFS[key] then return false, "unknown pose" end
+		if not plr then return false, "no target" end
+		local theirRoot = rootOf(plr)
+		if not theirRoot then return false, "target has no character" end
+		if not myRoot() then return false, "you have no character" end
+		state.pose = key
+		state.target = plr
+		ensureConn()
+		step() -- apply on the press, not on the next frame
+		return true
+	end
+
+	function M.release()
+		state.pose = nil
+		state.target = nil
+		if state.conn then
+			pcall(function() state.conn:Disconnect() end)
+			state.conn = nil
+		end
+		if state.conn2 then
+			pcall(function() state.conn2:Disconnect() end)
+			state.conn2 = nil
+		end
+	end
+
+	function M.active() return state.pose end
+	function M.target() return state.target end
+
+	function M.setOffset(key, field, value)
+		local o = state.offsets[key]
+		if not o then return false end
+		if field == "facing" then
+			o.facing = value
+		elseif field == "distance" then
+			o.distance = math.clamp(tonumber(value) or o.distance, 0, 30)
+		elseif field == "height" then
+			o.height = math.clamp(tonumber(value) or o.height, -10, 12)
+		end
+		return true
+	end
+
+	function M.getOffset(key) return state.offsets[key] end
+
+	function M.setLockFacing(on) state.lockFacing = on == true end
+	function M.lockFacing() return state.lockFacing end
+
+	function M.status()
+		return { pose = state.pose, target = state.target and state.target.Name or nil }
+	end
+
+	return M
+end
+
+	return Poses
+	end)()
+
 
 	local SelfLib = (function()
 --[[
@@ -3151,21 +3661,27 @@ end
 	-- ==========================================================================
 	-- interface: tabbed panel, adaptive for PC and touch
 	-- ==========================================================================
+	--[[
+	  Palette. Shifted from "dark purple app" to "cold HUD": the surfaces stay
+	  near-black so the glass window reads as a sheet of dark glass over the
+	  backdrop, and the accent is a cyan-violet pair rather than one hue, which is
+	  what keeps a futuristic UI from looking flat.
+	]]
 	local Theme = {
-		bg = Color3.fromRGB(9, 9, 12),
-		panel = Color3.fromRGB(17, 17, 22),
-		surface = Color3.fromRGB(22, 22, 29),
-		surfaceHi = Color3.fromRGB(31, 31, 40),
-		surfacePress = Color3.fromRGB(40, 34, 62),
-		hair = Color3.fromRGB(40, 40, 52),
-		accent = Color3.fromRGB(139, 92, 246),
-		accent2 = Color3.fromRGB(192, 132, 252),
-		accentSoft = Color3.fromRGB(58, 44, 96),
-		text = Color3.fromRGB(238, 238, 246),
-		dim = Color3.fromRGB(136, 136, 152),
-		faint = Color3.fromRGB(96, 96, 112),
-		good = Color3.fromRGB(52, 211, 153),
-		bad = Color3.fromRGB(239, 100, 100),
+		bg = Color3.fromRGB(7, 7, 12),
+		panel = Color3.fromRGB(13, 13, 20),
+		surface = Color3.fromRGB(20, 20, 30),
+		surfaceHi = Color3.fromRGB(29, 29, 43),
+		surfacePress = Color3.fromRGB(36, 32, 58),
+		hair = Color3.fromRGB(44, 46, 66),
+		accent = Color3.fromRGB(124, 92, 255),
+		accent2 = Color3.fromRGB(64, 220, 255),
+		accentSoft = Color3.fromRGB(46, 40, 82),
+		text = Color3.fromRGB(236, 240, 250),
+		dim = Color3.fromRGB(142, 148, 172),
+		faint = Color3.fromRGB(98, 104, 128),
+		good = Color3.fromRGB(52, 220, 176),
+		bad = Color3.fromRGB(255, 106, 118),
 	}
 	local Font = Enum.Font.Gotham
 
@@ -3176,6 +3692,9 @@ end
 		Players = Players,
 		RunService = RunService,
 		UserInput = UserInput,
+		UIS = UserInput,
+		TweenService = TweenService,
+		Lighting = game:GetService("Lighting"),
 		Workspace = Workspace,
 		LP = LP,
 		Config = Config,
@@ -3188,11 +3707,15 @@ end
 	local FX = FXLib.new(ctx)
 	local Grip = GripLib.new(ctx)
 	local Crash = CrashLib.new(ctx)
+	local Poses = PosesLib.new(ctx)
+	local Tools = ToolsLib.new(ctx)
 	ctx.Targets = Targets
 	ctx.SelfTools = SelfTools
 	ctx.FX = FX
 	ctx.Grip = Grip
 	ctx.Crash = Crash
+	ctx.Poses = Poses
+	ctx.Tools = Tools
 	-- the engine looks this up instead of naming the module (modules are built
 	-- after core.lua, so a direct name would resolve to a global - see Engine.stop)
 	Engine.fx = FX
@@ -3262,6 +3785,306 @@ end
 	local pool = {}
 	local conns = {}
 
+	------------------------------------------------------------------- backdrop
+	--[[
+	  The visual layer behind the panel.
+
+	  WHAT ROBLOX CAN AND CANNOT DO (measured, not assumed)
+	  - ImageLabel with an rbxassetid:      YES, this is the supported path.
+	  - VideoFrame with an rbxassetid:      YES, but only video YOU uploaded to
+	                                        Roblox and that passed moderation.
+	  - A YouTube URL / embed:              NO. There is no web player in Roblox
+	                                        and no executor API can add one.
+	  - Streaming that video's audio:       NO, and it is someone else's song.
+
+	  So this module draws the backdrop itself (gradients + drifting glow + grid +
+	  vignette + scanlines), which needs no upload and cannot be moderated away,
+	  and offers three optional hooks for your own uploaded assets:
+	      Config.BG_ImageId   an rbxassetid image, blurred and dimmed behind the UI
+	      Config.BG_VideoId   an rbxassetid video, same treatment
+	      Config.MusicId      an rbxassetid Sound for the panel music
+	  Set any of them to "" to fall back to the drawn backdrop.
+
+	  BLUR
+	  Roblox has no real gaussian blur on plain GuiObjects. What actually reads as
+	  blurred is three stacked ImageLabels at increasing scale and decreasing
+	  transparency, which smears the source image's edges - that is what bgBlur
+	  builds, and it is also why the image is scaled beyond the panel bounds
+	  (so the smear never shows a hard clipped edge).
+	]]
+	local Bg = {}
+	local bgLayer, bgImage, bgVideo, bgBlurFrames = {}, nil, nil, {}
+	local music, musicConn = nil, nil
+	local bgPaused = false
+	local bgTween = nil
+	local bgDrift = 0
+
+	Bg.muted = false
+	Bg.volume = 0.35
+
+	-- three-pass smear: each pass is a bigger, fainter copy of the one before
+	local function buildBlur(parent, imageId)
+		for _, f in ipairs(bgBlurFrames) do
+			if f.Destroy then pcall(function() f:Destroy() end) end
+		end
+		table.clear(bgBlurFrames)
+		for i = 1, 3 do
+			local img = new("ImageLabel", {
+				Name = "Blur" .. i,
+				Size = UDim2.new(1, 14 * i, 1, 14 * i),
+				Position = UDim2.new(0.5, 0, 0.5, 0),
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				BackgroundTransparency = 1,
+				Image = imageId,
+				ImageTransparency = 0.55 + i * 0.12,
+				ScaleType = Enum.ScaleType.Crop,
+				ZIndex = 1,
+			}, parent)
+			img.ClipsDescendants = false
+			corner(img, 12)
+			bgBlurFrames[#bgBlurFrames + 1] = img
+		end
+	end
+
+	function Bg.build(parentGui)
+		local holder = new("Frame", {
+			Name = "Backdrop",
+			Size = UDim2.fromOffset(BASE_W, BASE_H),
+			Position = UDim2.new(0, 24, 0.5, -BASE_H / 2),
+			BackgroundColor3 = Theme.bg,
+			BorderSizePixel = 0,
+			ZIndex = 2,
+			ClipsDescendants = true,
+		}, parentGui)
+		corner(holder, 16)
+
+		-- base wash: near-black with a violet floor, so panels sit on depth
+		local wash = new("Frame", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundColor3 = Color3.fromRGB(10, 8, 18),
+			BorderSizePixel = 0,
+			ZIndex = 1,
+		}, holder)
+		new("UIGradient", {
+			Rotation = 112,
+			Color = ColorSequence.new({
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(20, 14, 40)),
+				ColorSequenceKeypoint.new(0.5, Color3.fromRGB(8, 8, 14)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(4, 10, 20)),
+			}),
+		}, wash)
+
+		-- drifting light bloom: two soft ellipses on opposite corners, animated
+		-- with a sine so the backdrop breathes instead of sitting still
+		local bloomA = new("Frame", {
+			Size = UDim2.fromOffset(220, 220),
+			Position = UDim2.fromOffset(-60, -80),
+			BackgroundColor3 = Color3.fromRGB(120, 80, 255),
+			BackgroundTransparency = 0.86,
+			BorderSizePixel = 0,
+			ZIndex = 1,
+		}, holder)
+		corner(bloomA, 110)
+		local bloomB = new("Frame", {
+			Size = UDim2.fromOffset(180, 180),
+			Position = UDim2.new(1, -120, 1, -140),
+			BackgroundColor3 = Color3.fromRGB(40, 200, 255),
+			BackgroundTransparency = 0.9,
+			BorderSizePixel = 0,
+			ZIndex = 1,
+		}, holder)
+		corner(bloomB, 90)
+
+		-- fine grid, drawn as clips so it reads as a HUD rather than graph paper
+		local grid = new("Frame", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			ZIndex = 1,
+		}, holder)
+		for i = 1, 12 do
+			local v = new("Frame", {
+				Size = UDim2.new(0, 1, 1, 0),
+				Position = UDim2.fromScale(i / 13, 0),
+				BackgroundColor3 = Color3.fromRGB(120, 140, 255),
+				BackgroundTransparency = 0.94,
+				BorderSizePixel = 0,
+			}, grid)
+			local h = new("Frame", {
+				Size = UDim2.new(1, 0, 0, 1),
+				Position = UDim2.fromScale(0, i / 13),
+				BackgroundColor3 = Color3.fromRGB(120, 140, 255),
+				BackgroundTransparency = 0.94,
+				BorderSizePixel = 0,
+			}, grid)
+		end
+
+		-- optional user asset (image or video), blurred behind everything
+		local assetHost = new("Frame", {
+			Name = "Asset",
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			ZIndex = 1,
+			ClipsDescendants = true,
+		}, holder)
+		corner(assetHost, 16)
+		bgLayer.assetHost = assetHost
+
+		-- dimmer over the asset so text stays readable over a bright picture
+		local dim = new("Frame", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundColor3 = Color3.fromRGB(6, 6, 12),
+			BackgroundTransparency = 0.35,
+			BorderSizePixel = 0,
+			ZIndex = 2,
+		}, holder)
+		bgLayer.dim = dim
+
+		-- vignette: four edge gradients darken the border, which is what makes a
+		-- flat rectangle look like it has depth
+		for _, spec in ipairs({
+			{ rot = 0, y = 0, x = 0, w = 1, h = 0.22 },
+			{ rot = 180, y = 0.78, x = 0, w = 1, h = 0.22 },
+			{ rot = 90, y = 0, x = 0, w = 0.18, h = 1 },
+			{ rot = 270, y = 0, x = 0.82, w = 0.18, h = 1 },
+		}) do
+			local v = new("Frame", {
+				Size = UDim2.fromScale(spec.w, spec.h),
+				Position = UDim2.fromScale(spec.x, spec.y),
+				BackgroundColor3 = Color3.new(0, 0, 0),
+				BackgroundTransparency = 0,
+				BorderSizePixel = 0,
+				ZIndex = 2,
+			}, holder)
+			new("UIGradient", {
+				Rotation = spec.rot,
+				Transparency = NumberSequence.new({
+					NumberSequenceKeypoint.new(0, 1),
+					NumberSequenceKeypoint.new(1, 0.45),
+				}),
+			}, v)
+		end
+
+		bgLayer.holder = holder
+		bgLayer.bloomA = bloomA
+		bgLayer.bloomB = bloomB
+		return holder
+	end
+
+	-- apply an uploaded image: blurred smear + sharp copy at low transparency
+	function Bg.setImage(id)
+		local host = bgLayer.assetHost
+		if not host then return false end
+		if bgImage then pcall(function() bgImage:Destroy() end) bgImage = nil end
+		bgBlurFrames = bgBlurFrames or {}
+		for _, f in ipairs(bgBlurFrames) do
+			if f.Destroy then pcall(function() f:Destroy() end) end
+		end
+		table.clear(bgBlurFrames)
+		if type(id) ~= "string" or id == "" then
+			if bgLayer.dim then bgLayer.dim.BackgroundTransparency = 0.35 end
+			return true
+		end
+		local src = id:match("^rbxassetid://") and id or ("rbxassetid://" .. id)
+		buildBlur(host, src)
+		bgImage = new("ImageLabel", {
+			Name = "Sharp",
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			Image = src,
+			ImageTransparency = 0.35,
+			ScaleType = Enum.ScaleType.Crop,
+			ZIndex = 1,
+		}, host)
+		corner(bgImage, 16)
+		-- a picture this bright needs a stronger dim under the text
+		if bgLayer.dim then bgLayer.dim.BackgroundTransparency = 0.2 end
+		return true
+	end
+
+	-- apply an uploaded video: VideoFrame with the same dim + pause support
+	function Bg.setVideo(id)
+		local host = bgLayer.assetHost
+		if not host then return false end
+		if bgVideo then pcall(function() bgVideo:Destroy() end) bgVideo = nil end
+		if type(id) ~= "string" or id == "" then return true end
+		local src = id:match("^rbxassetid://") and id or ("rbxassetid://" .. id)
+		bgVideo = new("VideoFrame", {
+			Name = "Video",
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			Video = src,
+			Looped = true,
+			Muted = true,
+			Volume = 0,
+			ZIndex = 1,
+		}, host)
+		pcall(function() bgVideo:Play() end)
+		if bgLayer.dim then bgLayer.dim.BackgroundTransparency = 0.25 end
+		return true
+	end
+
+	-- pause / resume the backdrop video
+	function Bg.setPaused(paused)
+		bgPaused = paused == true
+		if bgVideo then
+			if bgPaused then pcall(function() bgVideo:Pause() end)
+			else pcall(function() bgVideo:Play() end) end
+		end
+		return bgPaused
+	end
+
+	function Bg.paused() return bgPaused end
+
+	-- optional panel music. Roblox Sound needs an uploaded rbxassetid.
+	function Bg.setMusic(id)
+		if music then
+			pcall(function() music:Destroy() end)
+			music = nil
+		end
+		if type(id) ~= "string" or id == "" then return true end
+		local src = id:match("^rbxassetid://") and id or ("rbxassetid://" .. id)
+		music = new("Sound", {
+			Name = "FaceBangMusic",
+			SoundId = src,
+			Looped = true,
+			Volume = Bg.muted and 0 or Bg.volume,
+			Playing = true,
+		}, parentGui)
+		return true
+	end
+
+	function Bg.mute(on)
+		Bg.muted = on == true
+		if music then pcall(function() music.Volume = Bg.muted and 0 or Bg.volume end) end
+		if bgVideo then pcall(function() bgVideo.Muted = true end) end -- always muted
+		return Bg.muted
+	end
+
+	function Bg.setVolume(v)
+		Bg.volume = math.clamp(tonumber(v) or Bg.volume, 0, 1)
+		if music and not Bg.muted then pcall(function() music.Volume = Bg.volume end) end
+	end
+
+	function Bg.stopMusic()
+		if music then pcall(function() music:Destroy() end) music = nil end
+	end
+
+	-- per-frame drift for the bloom. Cheap: two property writes.
+	function Bg.tick(dt)
+		if bgPaused then return end
+		bgDrift = bgDrift + (dt or 0)
+		local a = bgLayer and bgLayer.bloomA
+		local b = bgLayer and bgLayer.bloomB
+		if a then
+			a.Position = UDim2.fromOffset(-60 + math.sin(bgDrift * 0.32) * 18, -80 + math.cos(bgDrift * 0.24) * 14)
+		end
+		if b then
+			b.Position = UDim2.new(1, -120 + math.sin(bgDrift * 0.21 + 2) * 16, 1, -140 + math.cos(bgDrift * 0.29 + 1) * 12)
+		end
+	end
+
+	ctx.Bg = Bg
+
 	---------------------------------------------------------------------- shell
 	local gui = new("ScreenGui", {
 		Name = "FaceBangUI",
@@ -3302,17 +4125,40 @@ end
 	}, gui)
 	corner(shadow, 16)
 
+	Bg.build(gui)
+	if type(Config.BG_ImageId) == "string" and Config.BG_ImageId ~= "" then Bg.setImage(Config.BG_ImageId) end
+	if type(Config.BG_VideoId) == "string" and Config.BG_VideoId ~= "" then Bg.setVideo(Config.BG_VideoId) end
+	if type(Config.MusicId) == "string" and Config.MusicId ~= "" then
+		Bg.setMusic(Config.MusicId)
+		Bg.mute(Config.MusicMuted == true)
+	end
+
 	local win = new("Frame", {
 		Name = "Window",
 		Size = UDim2.fromOffset(BASE_W, BASE_H),
 		Position = UDim2.new(0, 24, 0.5, -BASE_H / 2),
 		BackgroundColor3 = Theme.panel,
+		BackgroundTransparency = 0.18,
 		BorderSizePixel = 0,
-		ZIndex = 2,
+		ZIndex = 4,
 	}, gui)
 	win.AnchorPoint = Vector2.new(0, 0)
 	corner(win, 16)
-	stroke(win, Color3.fromRGB(58, 58, 74), 1)
+	stroke(win, Theme.hair, 1, 0.25)
+
+	-- animated accent hairline: a gradient border whose colours slide, so the
+	-- window edge has motion without any per-frame property writes beyond one
+	-- UIGradient.Offset
+	local winStroke = new("UIStroke", { Thickness = 1.4, Color = Color3.new(1, 1, 1), Transparency = 0.15 }, win)
+	local winGrad = new("UIGradient", {
+		Rotation = 45,
+		Color = ColorSequence.new({
+			ColorSequenceKeypoint.new(0, Theme.accent),
+			ColorSequenceKeypoint.new(0.4, Theme.accent2),
+			ColorSequenceKeypoint.new(0.7, Theme.accent),
+			ColorSequenceKeypoint.new(1, Color3.fromRGB(30, 30, 48)),
+		}),
+	}, winStroke)
 	new("UIGradient", {
 		Rotation = 90,
 		Color = ColorSequence.new(Theme.panel, Theme.bg),
@@ -3533,9 +4379,14 @@ end
 		ClipsDescendants = true,
 	}, win)
 
+	-- tab width is derived from the tab count instead of being hard-coded 0.25:
+	-- adding a fifth tab made every label overrun its button at the old width
+	local TAB_NAMES = { "Aim", "Poses", "Self", "Players", "Server" }
+	local TAB_W = 1 / #TAB_NAMES
+
 	local function mkTab(name, order)
 		local b = new("TextButton", {
-			Size = UDim2.new(0.25, -3, 1, 0),
+			Size = UDim2.new(TAB_W, -3, 1, 0),
 			BackgroundColor3 = Theme.surface,
 			BackgroundTransparency = 1,
 			Text = name,
@@ -3610,7 +4461,7 @@ end
 		end
 	end
 
-	for i, name in ipairs({ "Aim", "Self", "Players", "Server" }) do
+	for i, name in ipairs(TAB_NAMES) do
 		local b = mkTab(name, i)
 		mkPage(name)
 		b.MouseButton1Click:Connect(function() showTab(name) end)
@@ -3960,6 +4811,87 @@ end
 	toggle(aim, 15, "screen kick", function(on) Config.FXShake = on end, false)
 	toggle(aim, 16, "outline the target", function(on) Config.FXMarker = on end, false)
 
+	---------------------------------------------------------------- Poses tab
+	--[[
+	  The attach/pose family from the reference tool, but every pose shares one
+	  movement core and one offset editor (see poses.lua). The old tool hard-coded
+	  its distances; here distance, height and facing are live-steppable and can be
+	  changed while the pose is active, so you tune it while watching it.
+	]]
+	local poPage = pages.Poses
+	local poo = 0
+	local function poOrder() poo += 1 return poo end
+
+	local poseLockToggle
+	local poseEditorRows = {}   -- rebuilt when the active pose changes
+	local poseEditorHost
+
+	local function refreshPoseEditor()
+		for _, r in ipairs(poseEditorRows) do
+			if r and r.Destroy then pcall(function() r:Destroy() end) end
+		end
+		table.clear(poseEditorRows)
+		local key = Poses.active()
+		if not key or not poseEditorHost then return end
+		local o = Poses.getOffset(key)
+		if not o then return end
+
+		-- label showing which pose is being edited
+		poseEditorRows[#poseEditorRows + 1] = section(poseEditorHost, 1, "tuning: " .. Poses.label(key))
+
+		poseEditorRows[#poseEditorRows + 1] = stepper(poseEditorHost, 2, "facing",
+			{ "front", "back", "left", "right" }, function(v)
+				Poses.setOffset(key, "facing", v)
+				out("pose facing: " .. v)
+			end, 1)
+
+		poseEditorRows[#poseEditorRows + 1] = stepper(poseEditorHost, 3, "distance",
+			{ 0.5, 1, 1.6, 2.2, 2.8, 3.5, 5 }, function(v)
+				Poses.setOffset(key, "distance", v)
+			end, 5)
+
+		poseEditorRows[#poseEditorRows + 1] = stepper(poseEditorHost, 4, "height",
+			{ -1.5, -0.6, 0, 1.2, 1.8, 2.6, 3.2 }, function(v)
+				Poses.setOffset(key, "height", v)
+			end, 3)
+	end
+
+	section(poPage, poOrder(), "attach to selected player")
+
+	for _, key in ipairs(Poses.keys()) do
+		action(poPage, poOrder(), Poses.label(key), function()
+			local p = pick()
+			if not p then out("select a player first") return end
+			local ok, err = Poses.apply(key, p)
+			out(ok and (Poses.label(key) .. " on " .. p.Name) or tostring(err))
+			refreshPoseEditor()
+		end)
+	end
+
+	action(poPage, poOrder(), "release pose", function()
+		Poses.release()
+		refreshPoseEditor()
+		out("pose released")
+	end)
+
+	section(poPage, poOrder(), "settings")
+
+	poseLockToggle = toggle(poPage, poOrder(), "lock facing (do not spin with them)", function(on)
+		Poses.setLockFacing(on)
+		out(on and "facing locked" or "facing follows target")
+	end, false)
+
+	-- AutomaticSize Y is required here: the editor rows are rebuilt when the
+	-- active pose changes, so a fixed height would either clip them or leave a
+	-- gap. Without it the host stays 12px tall and the controls are invisible.
+	poseEditorHost = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		LayoutOrder = poOrder(),
+	}, poPage)
+	new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, poseEditorHost)
+
 	------------------------------------------------------------------ Self tab
 	local selfPage = pages.Self
 	local so = 0
@@ -4040,6 +4972,56 @@ end
 	stepper(selfPage, sOrder(), "jump power", { 50, 75, 100, 150, 250 }, function(v) SelfTools.setJump(v) end, 1)
 
 	toggle(selfPage, sOrder(), "infinite jump", function(on) SelfTools.infiniteJump(on) end, false)
+
+	section(selfPage, sOrder(), "vision / esp")
+
+	local espToggle = toggle(selfPage, sOrder(), "ESP (name + distance)", function(on)
+		Tools.esp(on)
+		out(on and "ESP on" or "ESP off")
+	end, false)
+
+	toggle(selfPage, sOrder(), "ESP box", function(on)
+		Tools.setEspOption("box", on)
+	end, false)
+
+	toggle(selfPage, sOrder(), "ESP distance", function(on)
+		Tools.setEspOption("distance", on)
+	end, true)
+
+	toggle(selfPage, sOrder(), "fullbright (restores on off)", function(on)
+		Tools.fullbright(on)
+		out(on and "brighter" or "lighting restored")
+	end, false)
+
+	toggle(selfPage, sOrder(), "click to teleport", function(on)
+		Tools.clickTeleport(on)
+		out(on and "click the ground to move" or "click teleport off")
+	end, false)
+
+	section(selfPage, sOrder(), "music / backdrop")
+
+	--[[
+	  These three control the panel's own media, and they work whether or not you
+	  set a MusicId / BG_VideoId: mute and pause are real switches over a real
+	  Sound and VideoFrame, not cosmetic rows. With no asset configured they
+	  still toggle state and report it, so nothing lies about being on.
+	]]
+	local musicMuteToggle, musicPauseToggle
+
+	musicMuteToggle = toggle(selfPage, sOrder(), "mute music", function(on)
+		Bg.mute(on)
+		out(on and "music muted" or "music on")
+	end, Config.MusicMuted == true)
+
+	musicPauseToggle = toggle(selfPage, sOrder(), "pause backdrop video", function(on)
+		local p = Bg.setPaused(on)
+		out(p and "backdrop paused" or "backdrop playing")
+	end, false)
+
+	stepper(selfPage, sOrder(), "music volume", { 0, 0.15, 0.35, 0.6, 1 }, function(v)
+		Bg.setVolume(v)
+		out("volume " .. tostring(v))
+	end, 3)
 
 	section(selfPage, sOrder(), "teleport")
 
@@ -4487,8 +5469,13 @@ end
 		{ Scale = 1 }):Play()
 
 	local t0 = os.clock()
+	local lastT = os.clock()
 	conns[#conns + 1] = RunService.RenderStepped:Connect(function()
 		local now = os.clock() - t0
+		local dt = os.clock() - lastT
+		lastT = os.clock()
+		if Bg then Bg.tick(dt) end
+		if winGrad then winGrad.Offset = Vector2.new((now * 0.16) % 1, 0) end
 
 		-- header sheen sweeping left to right, then a pause before it repeats
 		local cycle = (now % 4.2) / 1.1
