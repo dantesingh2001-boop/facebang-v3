@@ -1,6 +1,6 @@
 --[[
 ================================================================================
-  FACE BANG   v3.0.0      on-the-face bangs / zero delay
+  FACE BANG   v3.0.2      on-the-face bangs / zero delay
 ================================================================================
   WHAT IT IS
   A client-side panel whose bang is a motion you own plus a picture at the
@@ -94,7 +94,7 @@
 
 do
 	-- single source of truth: the UI header prints this, so it must not drift
-	local VERSION = "3.0.0"
+	local VERSION = "3.0.2"
 
 	local ENV = (getgenv and getgenv()) or _G
 	if type(ENV.FaceBang) == "table" and type(ENV.FaceBang.Unload) == "function" then
@@ -3754,6 +3754,56 @@ end
 		}, obj)
 	end
 
+	--[[
+	  Glass treatment for a surface.
+
+	  Roblox has no backdrop blur, so "glass" has to be faked with light rather
+	  than refraction. What actually sells it:
+	    - a translucent fill, so the backdrop shows through
+	    - a 1px bright line along the TOP inner edge (light catching the bevel)
+	    - a faint dark line along the BOTTOM inner edge (shadow under the bevel)
+	    - a vertical gradient from slightly lighter to slightly darker
+	  Those four together read as a pane; any one alone reads as a flat box.
+	]]
+	local function glass(obj, opts)
+		opts = opts or {}
+		local tint = opts.tint or Theme.surface
+		obj.BackgroundColor3 = tint
+		obj.BackgroundTransparency = opts.fill or 0.28
+		obj.BorderSizePixel = 0
+
+		local g = new("UIGradient", {
+			Rotation = 90,
+			Transparency = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, math.max(0, (opts.fill or 0.28) - 0.10)),
+				NumberSequenceKeypoint.new(0.55, opts.fill or 0.28),
+				NumberSequenceKeypoint.new(1, math.min(1, (opts.fill or 0.28) + 0.12)),
+			}),
+		}, obj)
+
+		-- top bevel: a hairline that catches the light
+		local top = new("Frame", {
+			Size = UDim2.new(1, -12, 0, 1),
+			Position = UDim2.new(0, 6, 0, 0),
+			BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+			BackgroundTransparency = opts.topAlpha or 0.88,
+			BorderSizePixel = 0,
+			ZIndex = obj.ZIndex + 1,
+		}, obj)
+
+		-- bottom shadow
+		local bot = new("Frame", {
+			Size = UDim2.new(1, -12, 0, 1),
+			Position = UDim2.new(0, 6, 1, -1),
+			BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+			BackgroundTransparency = opts.botAlpha or 0.7,
+			BorderSizePixel = 0,
+			ZIndex = obj.ZIndex + 1,
+		}, obj)
+
+		return g, top, bot
+	end
+
 	-- a 2px bar used as a section marker, so labels read as grouped
 	local function bar(parent, color)
 		local b = new("Frame", {
@@ -3970,6 +4020,22 @@ end
 		return holder
 	end
 
+	--[[
+	  Keep the backdrop glued to the window.
+
+	  This is the bug that made a black rectangle sit on the screen away from the
+	  panel: the backdrop was built at a fixed position, but fitPanel() clamps the
+	  window into the viewport and drag repositions it, and only the shadows were
+	  being synced. So the opaque backdrop stayed behind at its spawn point while
+	  the panel moved off it.
+	]]
+	function Bg.sync(pos, size)
+		local h = bgLayer.holder
+		if not h then return end
+		h.Position = pos
+		h.Size = size
+	end
+
 	-- apply an uploaded image: blurred smear + sharp copy at low transparency
 	function Bg.setImage(id)
 		local host = bgLayer.assetHost
@@ -4171,6 +4237,9 @@ end
 		shadow.Size = win.Size
 		shadowFar.Position = UDim2.fromOffset(win.Position.X.Offset + 3, win.Position.Y.Offset + 10)
 		shadow.Position = UDim2.fromOffset(win.Position.X.Offset + 3, win.Position.Y.Offset + 4)
+		-- the backdrop must follow the window too, or it is left behind as an
+		-- opaque slab wherever it was first parented
+		Bg.sync(win.Position, win.Size)
 	end
 	local function fitPanel()
 		local vp = viewport()
@@ -4196,6 +4265,7 @@ end
 		ZIndex = 3,
 	}, win)
 	corner(header, 16)
+	glass(header, { tint = Theme.panel, fill = 0.12, topAlpha = 0.82, botAlpha = 0.85 })
 	-- square off the bottom corners: header sits flush against the body
 	new("Frame", {
 		Size = UDim2.new(1, 0, 0, 16),
@@ -4481,6 +4551,7 @@ end
 		}, page)
 		corner(r, 10)
 		stroke(r, Theme.hair, 1, 0.55)
+		glass(r, { tint = Theme.surface, fill = 0.30, topAlpha = 0.9, botAlpha = 0.78 })
 		return r
 	end
 
@@ -5615,9 +5686,36 @@ end
 		pcall(function() SelfTools.restoreAll() end)
 		pcall(function() FX.destroy() end)
 		pcall(function() SelfTools.stopPerf() end)
+		--[[
+		  These three are what left a black mark on screen after closing.
+
+		  Bg's music Sound and the ESP BillboardGuis are parented to PlayerGui /
+		  CoreGui rather than to `gui`, so destroying `gui` below does not reach
+		  them. An ESP box is a translucent dark Frame adorning a player, so the
+		  leftover reads as a black rectangle sitting in the world - and it stays
+		  because the only thing that would remove it was the ESP connection that
+		  unload had already dropped.
+		]]
+		pcall(function() Bg.stopMusic() end)
+		pcall(function() Bg.setVideo("") end)
+		pcall(function() Tools.esp(false) end)
 		for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
 		table.clear(conns)
 		if gui then gui:Destroy() end
+		-- belt and braces: sweep any ESP gui that survived a failed teardown, so a
+		-- reload can never stack a second set of boxes on top of the first
+		pcall(function()
+			local core = game:GetService("CoreGui")
+			for _, d in ipairs(core:GetDescendants()) do
+				if d.Name == "FB_ESP" then d:Destroy() end
+			end
+			local pgui = LP:FindFirstChildOfClass("PlayerGui")
+			if pgui then
+				for _, d in ipairs(pgui:GetDescendants()) do
+					if d.Name == "FaceBangMusic" then d:Destroy() end
+				end
+			end
+		end)
 		ENV.FaceBang = nil
 		notify("Face Bang", "Unloaded")
 	end
