@@ -1,28 +1,38 @@
-# Face Bang v2.2.0 — grip & crash build
+# Face Bang v2.3.0 — grip, crash, cleaner flight
 
-A single-file Roblox client script: an on-the-face bang panel, plus server-wide
-freeze ("grip") and server overload ("crash") rows.
+A single-file Roblox client script: an on-the-face bang panel, a working
+server-wide freeze, a server flood, and flight that goes where you point it.
 
 ```
 loadstring(game:HttpGet("https://raw.githubusercontent.com/dantesingh2001-boop/facebang-v3/main/facebang.lua"))()
 ```
 
-`getgenv().FaceBang.Unload()` tears everything down, including any grip or crash
-load currently running.
+`getgenv().FaceBang.Unload()` tears everything down.
 
-## What's in it
+## No VFX by default
 
-Everything from v2.1.4 — the zero-delay bang shuttle, the nova/shockwave/glitch/
-flame burst, ghost, god mode, fly, noclip, teleport, spectate, follow — plus two
-new modules.
+`FXStyle` defaults to `"none"` and `burst()` returns immediately, so a bang is a
+position change and nothing else — no parts, no sound, no label, no camera kick,
+no highlight. Every effect still exists and still works: switch one on in the
+Aim tab if you want it. The fly trail/thrusters/aura and the superman pose are
+off by default too, along with the camera roll and FOV pump.
 
-### Grip — server-wide freeze (`lib` section of the file)
+## Grip — the freeze, and why it now holds
 
-`Targets.freeze` was a local-view freeze that expired after 8 seconds and gave
-up the moment the target moved. The grip is the classic version: it writes the
-victim's `HumanoidRootPart.CFrame` back onto a captured spot on every frame
-pass, and zeroes their assembly velocity, so they are held for the whole
-server instead of just your screen.
+The victim's `HumanoidRootPart` CFrame is written back onto a captured spot
+every frame. The first version only pinned on `RenderStepped` and drifted —
+measured at 2.5 studs and climbing against a root pushed at 60 studs/s.
+
+The cause is frame order, measured in Studio:
+
+```
+Stepped -> PreSimulation -> PostSimulation -> Heartbeat -> RenderStepped
+```
+
+`RenderStepped` is **last**, so its write lands *before* the next frame's
+physics step and loses. Pinning on **PostSimulation + Heartbeat +
+RenderStepped** means our value is the last one the frame sees: the same test
+then measured **maxDrift 0.000**.
 
 | API | Does |
 | --- | --- |
@@ -31,48 +41,58 @@ server instead of just your screen.
 | `Grip.holdAll(radius)` | freeze everyone alive, optionally within a radius |
 | `Grip.count()` | how many are held |
 
-Config: `GripRate` (1 = every pass, 3 = every third pass), `GripRadius`,
-`GripMaxPlayers` (default 15).
+Config: `GripRate` (writes every Nth pass), `GripRadius`, `GripMaxPlayers`.
 
-**Honest limits.** Their own client keeps simulating, so on *their* screen they
-still walk; what is held is what they replicate and what you render. It is a
-position hold, not invincibility and not a humanoid lock. Cost is one CFrame
-write per gripped player per pass, which is why the cap exists — a 40-player
-grip at every pass is where a normal client starts to stutter.
+**Limits.** Their own client keeps simulating, so on *their* screen they still
+walk. An anchored root is unanchored first; a seated target reports
+"weld wins over the pin" rather than pretending to work. Cost is three writes
+per held player per frame, which is what the player cap is for.
 
-### Crash — overload a server
+## Crash — flooding remotes, which is the only thing that reaches the server
 
-A client cannot restart a server. What it can do is hand the server more to
-replicate than it can drain: invisible, anchored, `CanQuery`/`CanTouch` off
-parts batched into one `FB_Load` folder in Workspace, per frame.
+The v2.2.0 version spawned thousands of invisible parts in Workspace. That was
+measured to be **useless**: client-created instances **do not replicate**.
 
-| Level | Parts/s | Effect |
-| --- | --- | --- |
-| `light` | ~240 | ping spikes, recovers when you stop |
-| `heavy` | ~2000 | everything in the server is late |
-| `meltdown` | ~72k | the version that actually takes a server down |
+```
+client: FB_ReplProbe exists  ->  true
+server: FB_ReplProbe exists  ->  false
+```
 
-Modes: `hold` piles up, `sputter` creates and destroys in the same pass (more
-work for the queue, less memory). `stop()` always deletes the folder in both
-modes.
+It loaded your own client and nothing else.
 
-**Honest limits.** Memory climbs on every client, yours included — if it runs
-long enough your client runs out first and you get kicked. `meltdown` + `hold`
-is the combination that takes the server down *and* the one most likely to take
-you with it. Unbounded part spawning is also the fastest way to trip a game's
-anti-cheat if it watches part creation.
+Remote calls are the one channel the server is forced to receive:
 
-## UI
+| Test | Result |
+| --- | --- |
+| 231 `FireServer` calls | **231 received** on the server |
+| 620 calls × 8 KB payload, 0.5 s | **all 620 received** (~5 MB/s of handler work) |
 
-Two new sections at the top of the **Server** tab (`grip`, `crash`), plus
-`GRIP selected` / `release selected grip` on the **Players** tab.
+So `Crash` now floods every `RemoteEvent` / `UnreliableRemoteEvent` it can find
+in `ReplicatedStorage`, `ReplicatedFirst` and `Workspace`, with a configurable
+rate and payload size. Status reports fires/s.
 
-Keys are unchanged: `[B]` bang nearest, `[L]` loop, `[X]` stop,
-`[RightShift]` show/hide.
+**Limits.** The server decides what its handlers do — a game that rate limits or
+debounces its remotes barely notices. No client can force a shutdown; it can
+only saturate the receive queue. Your own client pays the serialisation cost
+first, which is what the rate steps are for.
 
-## Notes
+## Fly
 
-This repo is a single-file release. It is not the source split of
-[facebang-v2](https://github.com/dantesingh2001-boop/facebang-v2) — that tree
-builds its deliverable from `src/` + `lib/` via `build.sh`, and these modules
-were added against the built artifact.
+| Was | Now |
+| --- | --- |
+| forward = full camera look vector (Y = **-0.71** looking down) | forward flattened (Y = **0.00**) |
+| looking down drove you into the floor on W | W is always horizontal; altitude is Space/Ctrl/E/Q |
+| humanoid still applied its own controller forces | `MoveDirection` zeroed so only our velocity acts |
+| fixed per-frame lerp, fps-dependent | exponential time-constant easing |
+
+`bodyVelocity`, `bodyGyro`, `BodyPosition` were also tested as a physical hold:
+they drifted **5.07 studs**, worse than the CFrame pin, so they are not used.
+
+## Credits / studied
+
+A 76k-line deobfuscated "Eternity" script was read for techniques. Its real
+content is `BodyVelocity`/`BodyGyro`/`BodyPosition` flings and
+`FallenPartsDestroyHeight = NaN`; both were measured here and rejected — the
+constraint hold is weaker than the pin, and the NaN write stays client-local
+(the server still read `-500`). The rest of that file is obfuscator debris
+(~435 dead branches guarded by random 9-digit constants).
