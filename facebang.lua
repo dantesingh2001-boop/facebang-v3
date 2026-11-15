@@ -1,6 +1,6 @@
 --[[
 ================================================================================
-  FACE BANG   v3.0.2      on-the-face bangs / zero delay
+  FACE BANG   v3.0.3      on-the-face bangs / zero delay
 ================================================================================
   WHAT IT IS
   A client-side panel whose bang is a motion you own plus a picture at the
@@ -94,7 +94,7 @@
 
 do
 	-- single source of truth: the UI header prints this, so it must not drift
-	local VERSION = "3.0.2"
+	local VERSION = "3.0.3"
 
 	local ENV = (getgenv and getgenv()) or _G
 	if type(ENV.FaceBang) == "table" and type(ENV.FaceBang.Unload) == "function" then
@@ -3781,27 +3781,43 @@ end
 			}),
 		}, obj)
 
-		-- top bevel: a hairline that catches the light
-		local top = new("Frame", {
-			Size = UDim2.new(1, -12, 0, 1),
-			Position = UDim2.new(0, 6, 0, 0),
-			BackgroundColor3 = Color3.fromRGB(255, 255, 255),
-			BackgroundTransparency = opts.topAlpha or 0.88,
-			BorderSizePixel = 0,
-			ZIndex = obj.ZIndex + 1,
-		}, obj)
+		--[[
+		  The bevels are parented to the object's PARENT, not to the object.
+		  Any GuiObject child of a container with a UIListLayout is laid out as a
+		  list item - putting these inside tabBar made a 5-tab bar report 7
+		  children and squeeze the tabs. They are positioned absolutely over the
+		  surface instead, and re-placed whenever it moves or resizes.
+		]]
+		local host = obj.Parent
+		if not host then return g end
 
-		-- bottom shadow
-		local bot = new("Frame", {
-			Size = UDim2.new(1, -12, 0, 1),
-			Position = UDim2.new(0, 6, 1, -1),
-			BackgroundColor3 = Color3.fromRGB(0, 0, 0),
-			BackgroundTransparency = opts.botAlpha or 0.7,
-			BorderSizePixel = 0,
-			ZIndex = obj.ZIndex + 1,
-		}, obj)
+		local function makeBevel(color, transparency)
+			local f = new("Frame", {
+				Size = UDim2.new(obj.Size.X.Scale, obj.Size.X.Offset - 12, 0, 1),
+				BackgroundColor3 = color,
+				BackgroundTransparency = transparency,
+				BorderSizePixel = 0,
+				ZIndex = obj.ZIndex + 1,
+			}, host)
+			return f
+		end
 
-		return g, top, bot
+		local top = makeBevel(Color3.fromRGB(255, 255, 255), opts.topAlpha or 0.88)
+		local bot = makeBevel(Color3.new(0, 0, 0), opts.botAlpha or 0.7)
+
+		local function place()
+			local px, py = obj.Position.X, obj.Position.Y
+			top.Position = UDim2.new(px.Scale, px.Offset + 6, py.Scale, py.Offset)
+			bot.Position = UDim2.new(px.Scale, px.Offset + 6, py.Scale, py.Offset + obj.Size.Y.Offset - 1)
+			local w = UDim2.new(obj.Size.X.Scale, obj.Size.X.Offset - 12, 0, 1)
+			top.Size = w
+			bot.Size = w
+		end
+		place()
+		pcall(function()
+			obj:GetPropertyChangedSignal("Position"):Connect(place)
+			obj:GetPropertyChangedSignal("Size"):Connect(place)
+		end)
 	end
 
 	-- a 2px bar used as a section marker, so labels read as grouped
@@ -4426,11 +4442,30 @@ end
 		BorderSizePixel = 0,
 	}, win)
 	corner(tabBar, 9)
+	glass(tabBar, { tint = Theme.surface, fill = 0.42, topAlpha = 0.92, botAlpha = 0.8 })
 	new("UIListLayout", {
 		FillDirection = Enum.FillDirection.Horizontal,
 		Padding = UDim.new(0, 3),
 		SortOrder = Enum.SortOrder.LayoutOrder,
 	}, tabBar)
+
+	--[[
+	  Accent underline that slides to whichever tab is active. It is parented to
+	  the WINDOW, not to tabBar: tabBar has a UIListLayout, which would treat the
+	  underline as a list item and lay it out as a sixth tab.
+	]]
+	-- NB: all four of these are OFFSET components. Writing
+	-- UDim2.new(0, 18, HEADER_H + 36 + 30 - 2, 0) puts the sum in the SCALE field
+	-- and throws the bar thousands of pixels off screen.
+	local TAB_UNDER_Y = HEADER_H + 36 + 30 - 2
+	local tabUnderline = new("Frame", {
+		Size = UDim2.new(0, 22, 0, 2),
+		Position = UDim2.new(0, 18, 0, TAB_UNDER_Y),
+		BackgroundColor3 = Theme.accent2,
+		BorderSizePixel = 0,
+		ZIndex = 6,
+	}, win)
+	corner(tabUnderline, 1)
 	new("UIPadding", {
 		PaddingLeft = UDim.new(0, 3),
 		PaddingRight = UDim.new(0, 3),
@@ -4515,6 +4550,14 @@ end
 				TweenService:Create(p, TweenInfo.new(0.16, Enum.EasingStyle.Quint),
 					{ Position = UDim2.fromOffset(0, 0) }):Play()
 			end
+		end
+		-- slide the underline under the selected tab
+		local sel = tabButtons[name]
+		if sel and tabUnderline then
+			TweenService:Create(tabUnderline, TweenInfo.new(0.18, Enum.EasingStyle.Quint), {
+				Position = UDim2.new(0, 12 + sel.Position.X.Offset + sel.Size.X.Offset / 2 - 11,
+					0, TAB_UNDER_Y),
+			}):Play()
 		end
 		for n, b in pairs(tabButtons) do
 			local on = (n == name)
@@ -5093,6 +5136,19 @@ end
 		Bg.setVolume(v)
 		out("volume " .. tostring(v))
 	end, 3)
+
+	-- says plainly what is and is not configured, instead of the rows silently
+	-- doing nothing when no asset id was supplied
+	action(selfPage, sOrder(), "backdrop / music info", function()
+		local img = Config.BG_ImageId ~= "" and Config.BG_ImageId or "not set"
+		local vid = Config.BG_VideoId ~= "" and Config.BG_VideoId or "not set"
+		local mus = Config.MusicId ~= "" and Config.MusicId or "not set"
+		out(string.format("image %s | video %s | music %s", img, vid, mus))
+		if img == "not set" and vid == "not set" then
+			out("using the built-in drawn backdrop")
+			out("to use a picture: upload it to Roblox, then set BG_ImageId at the top of the script")
+		end
+	end)
 
 	section(selfPage, sOrder(), "teleport")
 
